@@ -1,0 +1,11 @@
+Mistral Vibe
+Copyright 2025 Mistral AI
+
+This product includes software originally developed by Mistral AI
+(https://mistral.ai/), licensed under the Apache License, Version 2.0.
+See the LICENSE file for the full license text.
+
+This repository is a fork maintained by Nemois (https://nemois.com).
+Files modified by Nemois relative to the upstream Mistral AI source carry
+an in-file notice identifying the change; see git history for full detail
+on each modification.

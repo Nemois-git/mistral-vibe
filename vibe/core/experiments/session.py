@@ -1,3 +1,5 @@
+# Modified by Nemois (nemois.com), 2026-09-19: see git history for details.
+# Licensed under the Apache License, Version 2.0; see LICENSE and NOTICE.
 from __future__ import annotations
 
 import asyncio

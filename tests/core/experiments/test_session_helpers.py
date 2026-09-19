@@ -57,17 +57,23 @@ def _make_config(
 
 
 @pytest.mark.asyncio
-async def test_initialize_returns_false_when_telemetry_disabled(
+async def test_initialize_returns_false_when_experiments_disabled(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     persist = AsyncMock()
     session_logger = MagicMock()
     session_logger.persist_experiments = persist
     manager = ExperimentManager(client=_StubClient(None))
+    
+    # No Mistral provider - experiments disabled, no provider
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: None,
+    )
 
     result = await initialize_experiments(
         harness=ExperimentSurface.LEGACY,
-        config=_make_config(enable_telemetry=False),
+        config=_make_config(enable_experiments=False),
         manager=manager,
         session_logger=session_logger,
         launch_context=None,
@@ -75,6 +81,49 @@ async def test_initialize_returns_false_when_telemetry_disabled(
 
     assert result[0] is False
     persist.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_initialize_works_when_telemetry_disabled_but_experiments_enabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Experiments should work when telemetry is off but experiments are enabled."""
+    persist = AsyncMock()
+    session_logger = MagicMock()
+    session_logger.persist_experiments = persist
+    
+    # Mock Mistral provider with API key
+    provider_mock = MagicMock()
+    provider_mock.api_base = "https://api.mistral.ai/v1"
+    provider_mock.api_key_env_var = "MISTRAL_API_KEY"
+    
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (provider_mock, "fake-api-key"),
+    )
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.fetch_identity",
+        AsyncMock(return_value=None),
+    )
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.fetch_whoami",
+        AsyncMock(return_value=None),
+    )
+    
+    manager = ExperimentManager(client=_StubClient(None))
+    
+    result = await initialize_experiments(
+        harness=ExperimentSurface.LEGACY,
+        config=_make_config(enable_telemetry=False, enable_experiments=True),
+        manager=manager,
+        session_logger=session_logger,
+        launch_context=None,
+    )
+    
+    # Should return False because identity/whoami are None, but not because of telemetry
+    assert result[0] is False
+    # user_plan should be None because whoami is None
+    assert result[1] is None
 
 
 @pytest.mark.asyncio
@@ -432,7 +481,7 @@ async def test_initialize_omits_organization_id_when_identity_unavailable(
 
 
 @pytest.mark.asyncio
-async def test_hydrate_returns_false_when_telemetry_disabled() -> None:
+async def test_hydrate_returns_false_when_experiments_disabled() -> None:
     session_logger = MagicMock()
     response = EvalResponse.model_validate({
         "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
@@ -441,7 +490,7 @@ async def test_hydrate_returns_false_when_telemetry_disabled() -> None:
     manager = ExperimentManager(client=_StubClient(None))
 
     result = await hydrate_experiments_from_session(
-        config=_make_config(enable_telemetry=False),
+        config=_make_config(enable_experiments=False),
         manager=manager,
         session_logger=session_logger,
     )
@@ -687,6 +736,26 @@ async def test_hydrate_returns_false_when_experiments_disabled() -> None:
 
     assert result is False
     assert manager.export_state() is None
+
+
+@pytest.mark.asyncio
+async def test_hydrate_works_when_telemetry_disabled_but_experiments_enabled() -> None:
+    """Hydration should work when telemetry is off but experiments are enabled."""
+    session_logger = MagicMock()
+    response = EvalResponse.model_validate({
+        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
+    })
+    session_logger.session_metadata.experiments = response
+    manager = ExperimentManager(client=_StubClient(None))
+
+    result = await hydrate_experiments_from_session(
+        config=_make_config(enable_telemetry=False, enable_experiments=True),
+        manager=manager,
+        session_logger=session_logger,
+    )
+
+    assert result is True
+    assert manager.export_state() is not None
 
 
 @pytest.mark.asyncio

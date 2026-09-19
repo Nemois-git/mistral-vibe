@@ -62,7 +62,7 @@ def store_cached_eval_response(
 
 
 def _cache_key(config: VibeConfigSchema) -> str | None:
-    if not config.enable_telemetry or not config.experiments.enable:
+    if not config.experiments.enable:
         return None
     from vibe.core.experiments.manager import hash_api_key
     from vibe.core.telemetry.send import get_mistral_provider_and_api_key

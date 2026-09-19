@@ -110,8 +110,13 @@ async def initialize_experiments(
     resolve_identity: IdentityResolver | None = None,
     resolve_whoami: WhoAmIResolver | None = None,
 ) -> tuple[bool, str | None]:
-    if not config.enable_telemetry:
+    # Fetch identity/whoami if we have a Mistral provider and either telemetry or experiments are enabled
+    # This allows telemetry segmentation when experiments are disabled, and GrowthBook eval when experiments are enabled
+    provider_and_key = get_mistral_provider_and_api_key(config)
+    if provider_and_key is None and not config.experiments.enable:
+        # No Mistral provider and experiments disabled - nothing to do
         return False, None
+    
     attributes, user_plan = await _fetch_plan_attributes(
         config=config,
         launch_context=launch_context,
@@ -122,10 +127,10 @@ async def initialize_experiments(
     if attributes is None:
         # Mistral provider present but key missing — tried but failed.
         return False, user_plan
-    if user_plan == NO_PLAN_DATA or not config.experiments.enable:
-        # No Mistral provider (sentinel) or the A/B opt-out: keep the attribute
-        # snapshot + user_plan for telemetry segmentation, but run no GrowthBook
-        # eval (no bucketing, no eval cache, no prompt refresh, no persist).
+    
+    if not config.experiments.enable:
+        # A/B opt-out: keep the attribute snapshot + user_plan for telemetry segmentation,
+        # but run no GrowthBook eval (no bucketing, no eval cache, no prompt refresh, no persist).
         manager.set_attributes(attributes)
         return False, user_plan
     await manager.initialize(attributes)
@@ -170,12 +175,10 @@ async def hydrate_experiments_from_session(
     refresh); the assignment stays frozen so variants do not re-bucket on
     resume.
     """
-    if not config.enable_telemetry:
+    if not config.experiments.enable:
         return False
     metadata = session_logger.session_metadata
     if metadata is None or metadata.experiments is None:
-        return False
-    if not config.experiments.enable:
         return False
     manager.hydrate(metadata.experiments)
     return True
@@ -198,7 +201,7 @@ async def resolve_plan_attributes(
     its plan/org data reflects the current user. Because the source is the user
     cache (not ``meta.json``), resuming never changes the reported plan.
     """
-    if not config.enable_telemetry:
+    if not config.experiments.enable:
         return None
     attributes, user_plan = await _fetch_plan_attributes(
         config=config,

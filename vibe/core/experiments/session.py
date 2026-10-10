@@ -8,7 +8,10 @@ from typing import TYPE_CHECKING, Final, Protocol
 
 from vibe import __version__
 from vibe.core.experiments.active import ExperimentSurface
-from vibe.core.experiments.cache import store_cached_eval_response
+from vibe.core.experiments.cache import (
+    clear_cached_eval_responses,
+    store_cached_eval_response,
+)
 from vibe.core.experiments.manager import ExperimentManager
 from vibe.core.experiments.models import EvalResponse, ExperimentAttributes
 from vibe.core.identity import IdentityResult, fetch_identity
@@ -112,6 +115,12 @@ async def initialize_experiments(
     resolve_identity: IdentityResolver | None = None,
     resolve_whoami: WhoAmIResolver | None = None,
 ) -> tuple[bool, str | None]:
+    if not config.experiments.enable:
+        # The `vibe` launcher reads this cache without the config, so opting
+        # out of experiments must drop it — telemetry opt-out alone does not,
+        # since the eval cache is no longer telemetry-gated.
+        clear_cached_eval_responses()
+
     # Fetch identity/whoami if we have a Mistral provider and either telemetry or experiments are enabled
     # This allows telemetry segmentation when experiments are disabled, and GrowthBook eval when experiments are enabled
     provider_and_key = get_mistral_provider_and_api_key(config)

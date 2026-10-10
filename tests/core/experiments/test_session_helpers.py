@@ -18,6 +18,7 @@ from vibe.core.experiments.session import (
     resolve_plan_attributes,
 )
 from vibe.core.identity import IdentityResult
+from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE
 from vibe.core.telemetry.types import LaunchContext, TerminalEmulator
 from vibe.setup.auth.whoami import WhoAmIResult
 
@@ -126,6 +127,56 @@ async def test_initialize_works_when_telemetry_disabled_but_experiments_enabled(
     assert result[0] is False
     # user_plan should be None because whoami is None
     assert result[1] is None
+
+
+@pytest.mark.asyncio
+async def test_initialize_clears_eval_cache_when_experiments_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # The `vibe` launcher reads the eval cache without the config, so opting
+    # out of experiments must drop any stale bucketing left on disk.
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (MagicMock(), "fake-key"),
+    )
+    cache_path = EXPERIMENT_EVAL_CACHE_FILE.path
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text('{"key": {"stored_at_timestamp": 1, "payload": {}}}')
+
+    await initialize_experiments(
+        harness=ExperimentSurface.LEGACY,
+        config=_make_config(enable_experiments=False),
+        manager=ExperimentManager(client=_StubClient(None)),
+        session_logger=MagicMock(persist_experiments=AsyncMock()),
+        launch_context=None,
+    )
+
+    assert not cache_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_initialize_keeps_eval_cache_when_only_telemetry_disabled(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Telemetry opt-out alone must NOT drop the eval cache — the eval cache
+    # is gated on `experiments.enable` only, not on telemetry.
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (MagicMock(), "fake-key"),
+    )
+    cache_path = EXPERIMENT_EVAL_CACHE_FILE.path
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text('{"key": {"stored_at_timestamp": 1, "payload": {}}}')
+
+    await initialize_experiments(
+        harness=ExperimentSurface.LEGACY,
+        config=_make_config(enable_telemetry=False, enable_experiments=True),
+        manager=ExperimentManager(client=_StubClient(None)),
+        session_logger=MagicMock(persist_experiments=AsyncMock()),
+        launch_context=None,
+    )
+
+    assert cache_path.exists()
 
 
 @pytest.mark.asyncio

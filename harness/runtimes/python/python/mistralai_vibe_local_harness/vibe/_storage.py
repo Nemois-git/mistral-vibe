@@ -39,6 +39,7 @@ from mistralai_vibe_local_harness.protocol import (
     RustAcceptedApplyResult,
     RustActionsNextAction,
     RustAudioContentBlock,
+    RustBackgroundProcessNotificationSource,
     RustCapabilitiesChange,
     RustDispatchActionDirective,
     RustEmbeddedResourceContentBlock,
@@ -48,9 +49,11 @@ from mistralai_vibe_local_harness.protocol import (
     RustHarnessInput,
     RustHarnessSettings,
     RustImageContentBlock,
+    RustInputModality,
     RustKeepActionDirective,
     RustLLMCallAction,
     RustModelToolCallPart,
+    RustNotificationEvent,
     RustPluginContextDefinition,
     RustPluginsChange,
     RustReasoningPart,
@@ -155,11 +158,22 @@ type Timestamp = Annotated[
 # journaled settings changes, and as reserved command parameters, and every one
 # of those reads goes through `_fill_program_time_limits`.
 _PROGRAM_TIME_LIMIT_DEFAULTS = {"max_elapsed_ms": 60_000, "max_sleep_ms": 30_000}
+# Settings stored before input modalities existed come from a Core that did not
+# check modalities; they read back as accepting every modality.
+_UNRECORDED_INPUT_MODALITIES: list[RustInputModality] = ["text", "image"]
 
 
-def _fill_program_time_limits(value: object) -> object:
-    if not isinstance(value, dict):
+def _fill_input_modalities(value: dict[str, Any]) -> dict[str, Any]:
+    context = value.get("context")
+    if not isinstance(context, dict) or "input_modalities" in context:
         return value
+    return {
+        **value,
+        "context": {**context, "input_modalities": _UNRECORDED_INPUT_MODALITIES},
+    }
+
+
+def _fill_program_time_limits(value: dict[str, Any]) -> dict[str, Any]:
     tools = value.get("tools")
     programmatic = tools.get("programmatic") if isinstance(tools, dict) else None
     if not isinstance(tools, dict) or not isinstance(programmatic, dict):
@@ -174,17 +188,14 @@ def _fill_program_time_limits(value: object) -> object:
     return {**value, "tools": {**tools, "programmatic": {**programmatic, **missing}}}
 
 
-type StoredHarnessSettings = Annotated[
-    RustHarnessSettings, BeforeValidator(_fill_program_time_limits)
-]
+def _fill_stored_settings(value: object) -> object:
+    if not isinstance(value, dict):
+        return value
+    return _fill_input_modalities(_fill_program_time_limits(value))
 
 
-def parse_stored_settings(value: JsonValue) -> RustHarnessSettings:
-    """Read settings that a reserved command persisted as its parameters."""
-    return RustHarnessSettings.model_validate(_fill_program_time_limits(value))
-
-
-def _fill_journaled_settings_changes(value: object) -> object:
+def _fill_stored_input_settings(value: object) -> object:
+    """Fill every settings change a journaled reconfigure input carries."""
     if not isinstance(value, dict):
         return value
     command = value.get("command")
@@ -193,21 +204,55 @@ def _fill_journaled_settings_changes(value: object) -> object:
     changes = command.get("changes")
     if not isinstance(changes, list):
         return value
-    filled = [_fill_settings_change(change) for change in changes]
+    filled = [
+        {**change, "value": _fill_stored_settings(change.get("value"))}
+        if isinstance(change, dict) and change.get("type") == "settings"
+        else change
+        for change in changes
+    ]
     return {**value, "command": {**command, "changes": filled}}
 
 
-def _fill_settings_change(change: object) -> object:
-    if not isinstance(change, dict) or change.get("type") != "settings":
-        return change
-    if "value" not in change:
-        return change
-    return {**change, "value": _fill_program_time_limits(change["value"])}
+def _drop_commits_without_call(value: object) -> object:
+    """Drop committed tool results stored without their effective call.
+
+    The call cannot be recovered once the Action's request is pruned. A stored
+    transition's observations were projected when Core emitted them, and
+    recovery only re-drives its next Actions, so nothing reads them again.
+    """
+    if not isinstance(value, dict):
+        return value
+    observations = value.get("observations")
+    if not isinstance(observations, list):
+        return value
+    kept = [
+        observation
+        for observation in observations
+        if not (
+            isinstance(observation, dict)
+            and observation.get("type") == "tool_result_committed"
+            and "call" not in observation
+        )
+    ]
+    if len(kept) == len(observations):
+        return value
+    return {**value, "observations": kept}
 
 
-type StoredHarnessInput = Annotated[
-    RustHarnessInput, BeforeValidator(_fill_journaled_settings_changes)
+type StoredHarnessSettings = Annotated[
+    RustHarnessSettings, BeforeValidator(_fill_stored_settings)
 ]
+type StoredHarnessInput = Annotated[
+    RustHarnessInput, BeforeValidator(_fill_stored_input_settings)
+]
+type StoredSessionTransition = Annotated[
+    RustSessionTransition, BeforeValidator(_drop_commits_without_call)
+]
+
+
+def parse_stored_settings(value: JsonValue) -> RustHarnessSettings:
+    """Read settings that a reserved command persisted as its parameters."""
+    return RustHarnessSettings.model_validate(_fill_stored_settings(value))
 
 
 class _StoredModel(BaseModel):
@@ -601,7 +646,7 @@ class ChildDependencyV1(_StoredModel):
 
 
 class SessionPin(StrEnum):
-    """A user-selected choice pinned to a session and restored when it reopens.
+    """A choice pinned to a session and restored when it reopens.
 
     Each member's value is the ``SessionMetadataV1`` field that stores it, so the
     storage, lookup, and propagation of pins stay generic: adding a new pin is a
@@ -777,7 +822,7 @@ class RuntimeStateV3(_RuntimeStateBase):
     core_system_instructions: str | None = None
     """The system instructions Core held when this generation was checkpointed."""
 
-    pending_transition: RustSessionTransition | None = None
+    pending_transition: StoredSessionTransition | None = None
     subagents: SubagentRuntimeState | None = None
     parent_command_receipts: dict[str, ParentOriginatedChildCommandReceipt] = Field(
         default_factory=dict
@@ -3237,15 +3282,31 @@ class UnifiedSessionStore:  # noqa: PLR0904 - cohesive session store surface
 
     def resolve_callback(
         self, callback_id: str, result: JsonValue, *, failed: bool = False
-    ) -> CallbackResolvedRecordV1:
-        record = self.append_record(
-            "callback_resolved",
-            CallbackResolvedPayloadV1(
-                callback_id=callback_id,
-                state="failed" if failed else "resolved",
-                result=result,
-            ),
+    ) -> CallbackResolvedRecordV1 | None:
+        """Journal a callback result, or nothing when no registration is pending.
+
+        A callback is settled once: the first result stands. A late result, such
+        as an interrupt closing a callback whose answer already landed, is
+        dropped rather than journalled, because a reader that enforces one
+        result per registration could then never load the store again.
+        """
+        payload = CallbackResolvedPayloadV1(
+            callback_id=callback_id,
+            state="failed" if failed else "resolved",
+            result=result,
         )
+        with self._journal_capacity_lock:
+            callback = next(
+                (
+                    item
+                    for item in self.load().runtime_state.callbacks
+                    if item.callback_id == callback_id
+                ),
+                None,
+            )
+            if callback is None or callback.state != "pending":
+                return None
+            record = self.append_record("callback_resolved", payload)
         if not isinstance(record, CallbackResolvedRecordV1):
             raise TypeError("journal record parser returned the wrong type")
         return record
@@ -3561,26 +3622,45 @@ def transition_sha256(transition: RustSessionTransition) -> str:
     return sha256_json(transition.model_dump(mode="json", by_alias=True))
 
 
-def _replay_transition_sha256(transition: RustSessionTransition) -> str:
+def _replay_transition_sha256(
+    transition: RustSessionTransition, *, include_committed_calls: bool = True
+) -> str:
     return _digest_with_llm_actions_normalized(
-        transition, _normalize_llm_action_for_replay
+        transition,
+        _normalize_llm_action_for_replay,
+        include_committed_calls=include_committed_calls,
     )
 
 
 def _replay_transition_sha256_with_model_input(
-    transition: RustSessionTransition,
+    transition: RustSessionTransition, *, include_committed_calls: bool = True
 ) -> str:
     return _digest_with_llm_actions_normalized(
-        transition, _normalize_llm_action_for_replay_with_model_input
+        transition,
+        _normalize_llm_action_for_replay_with_model_input,
+        include_committed_calls=include_committed_calls,
     )
 
 
 def _digest_with_llm_actions_normalized(
-    transition: RustSessionTransition, normalize: Callable[[dict[str, JsonValue]], None]
+    transition: RustSessionTransition,
+    normalize: Callable[[dict[str, JsonValue]], None],
+    *,
+    include_committed_calls: bool = True,
 ) -> str:
     value = cast(
         dict[str, JsonValue], transition.model_dump(mode="json", by_alias=True)
     )
+    if not include_committed_calls:
+        observations = value.get("observations")
+        if isinstance(observations, list):
+            for observation in observations:
+                if (
+                    isinstance(observation, dict)
+                    and observation.get("type") == "tool_result_committed"
+                ):
+                    observation.pop("call", None)
+
     next_action = value.get("next")
     if not isinstance(next_action, dict) or next_action.get("type") != "actions":
         return sha256_json(value)
@@ -3606,10 +3686,21 @@ def _transition_matches_recorded_digest(
         return True
     if payload.replay_transition_sha256 is not None:
         recorded = payload.replay_transition_sha256
-        return (
+        if (
             # Journals recorded before the model input left the digest.
             _replay_transition_sha256_with_model_input(transition) == recorded
             or _replay_transition_sha256(transition) == recorded
+        ):
+            return True
+
+        # Journals recorded before committed observations carried their effective call.
+        return (
+            _replay_transition_sha256_with_model_input(
+                transition, include_committed_calls=False
+            )
+            == recorded
+            or _replay_transition_sha256(transition, include_committed_calls=False)
+            == recorded
         )
     legacy_digest = _legacy_transition_sha256(transition, durable_actions)
     return legacy_digest == payload.transition_sha256
@@ -3674,12 +3765,22 @@ def _normalize_llm_action_for_replay(action: dict[str, JsonValue]) -> None:
     # replacement where the live Core sent an increment, so replay cannot compare it.
     action.pop("max_iterations", None)
     action.pop("model_input", None)
+    _drop_compaction_request_kind(action)
+
+
+def _drop_compaction_request_kind(action: dict[str, JsonValue]) -> None:
+    # A compaction's request kind shapes how the Runtime sends it, like the model
+    # input. Journals recorded before Core named it carry none, and their retry
+    # after an invalid summary resent the in-context request where Core now
+    # sends the standalone one; the recorded result replays the same either way.
+    action.pop("request", None)
 
 
 def _normalize_llm_action_for_replay_with_model_input(
     action: dict[str, JsonValue],
 ) -> None:
     action.pop("max_iterations", None)
+    _drop_compaction_request_kind(action)
     model_input = action.get("model_input")
     if not isinstance(model_input, dict):
         return
@@ -3983,7 +4084,10 @@ def _apply_journal(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per journal 
                 if payload.notification_id != expected_id:
                     raise ValueError("process notification has an invalid identity")
                 existing = submitted_process_notifications.get(payload.process_id)
-                if existing is not None and existing != payload:
+                if (
+                    existing is not None
+                    and existing.notification_id != payload.notification_id
+                ):
                     raise ValueError("conflicting process notification acknowledgement")
                 submitted_process_notifications[payload.process_id] = (
                     SubmittedProcessNotificationV1(
@@ -4002,8 +4106,12 @@ def _apply_journal(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per journal 
                 )
             case CallbackResolvedRecordV1(payload=payload):
                 callback = callbacks.get(payload.callback_id)
-                if callback is None or callback.state != "pending":
-                    raise ValueError("callback result has no pending registration")
+                if callback is None:
+                    raise ValueError("callback result has no registration")
+                if callback.state != "pending":
+                    # The first result settled the callback and a later one changes
+                    # nothing. Rejecting it would leave the session unloadable.
+                    continue
                 callbacks[payload.callback_id] = callback.model_copy(
                     update={"state": payload.state, "result": payload.result}
                 )
@@ -4045,8 +4153,32 @@ def _apply_journal(  # noqa: PLR0912, PLR0914, PLR0915 - one branch per journal 
                         ),
                     }
                 )
-            case CoreInputRecordV1():
-                pass
+            case CoreInputRecordV1(payload=payload):
+                # Core forgets a process notification ID once it delivers the
+                # notification, so the journalled Core input is what marks the
+                # notification submitted. A failed or interrupted acknowledgement
+                # write must not let a retry submit it again.
+                command = payload.input.command
+                if not isinstance(command, RustNotificationEvent):
+                    continue
+                source = command.notification.source
+                if not isinstance(source, RustBackgroundProcessNotificationSource):
+                    continue
+                process = processes.get(source.process_id)
+                if (
+                    process is None
+                    or process.status != source.status
+                    or command.notification.id
+                    != _process_notification_id(source.process_id)
+                ):
+                    continue
+                submitted_process_notifications.setdefault(
+                    source.process_id,
+                    SubmittedProcessNotificationV1(
+                        process_id=source.process_id,
+                        notification_id=command.notification.id,
+                    ),
+                )
     sequence = records[-1].sequence if records else runtime.snapshot_sequence
     effective_actions = sorted(actions.values(), key=lambda item: item.action_id)
     effective_processes = sorted(processes.values(), key=lambda item: item.process_id)

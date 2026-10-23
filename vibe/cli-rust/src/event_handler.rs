@@ -206,10 +206,10 @@ fn apply_ready(
     app.view
         .transcript
         .set_show_reasoning(startup::read_show_thinking_nodes(&runtime));
-    message_queue::reconcile_snapshot(app, client, &state);
     // The picker can resume before the handshake finishes, and that session
     // wins: the one started here is only what Esc would fall back to.
     if !app.session.resumed {
+        message_queue::reconcile_snapshot(app, client, &state);
         app.set_session_id(state.session.id.clone());
         app.subagents.seed_snapshot(state.child_sessions.clone());
         subagents::refresh(app);
@@ -299,6 +299,7 @@ fn record_startup(app: &mut App, attach: &startup::Attach, is_cold_start: bool) 
         "is_resuming_session": matches!(attach, startup::Attach::Resumed(_)),
         "prompt_for_workspace_trust": app.session.trust_prompted,
         "is_cold_start": is_cold_start,
+        "mouse_capture": app.session.startup_config.enable_mouse_capture,
     }));
     app.session.startup_telemetry = Some(properties);
     flush_startup_telemetry(app);
@@ -342,6 +343,9 @@ pub fn apply_runtime_value(app: &mut App, runtime: &Value) {
     crate::terminal_notifier::configure(app, runtime);
     app.subagents.status_list_enabled = startup::read_show_subagent_status_list(runtime);
     app.quit.ask_confirmation_on_exit = startup::read_ask_confirmation_on_exit(runtime);
+    let show_thinking = startup::read_show_thinking_nodes(runtime);
+    app.view.transcript.set_show_reasoning(show_thinking);
+    app.subagents.transcripts.set_show_reasoning(show_thinking);
     subagents::refresh(app);
     let narrator_enabled = app.session.startup_config.narrator_enabled;
     let version = app.session.startup_config.server_version.clone();

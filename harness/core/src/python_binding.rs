@@ -18,17 +18,28 @@ pub(crate) struct PyHarnessSession {
 #[pymethods]
 impl PyHarnessSession {
     #[staticmethod]
-    fn create(py: Python<'_>, config_json: &str, initial_history_json: &str) -> PyResult<Self> {
+    #[pyo3(signature = (config_json, initial_history_json, conversation_json = None))]
+    fn create(
+        py: Python<'_>,
+        config_json: &str,
+        initial_history_json: &str,
+        conversation_json: Option<&str>,
+    ) -> PyResult<Self> {
         let engine = Arc::clone(&SHARED_ENGINE);
         let config_value = config_json.to_string();
         let initial_history_value = initial_history_json.to_string();
+        let conversation_value = conversation_json.map(str::to_owned);
         let handle = py
             .detach({
                 let engine = Arc::clone(&engine);
                 move || {
                     let config = decode_json(&config_value, "harness config")?;
                     let initial_history = decode_json(&initial_history_value, "initial history")?;
-                    engine.create_with_history(config, initial_history)
+                    let conversation = conversation_value
+                        .as_deref()
+                        .map(|value| decode_json(value, "conversation seed"))
+                        .transpose()?;
+                    engine.create_with_conversation(config, initial_history, conversation)
                 }
             })
             .map_err(PyValueError::new_err)?;
@@ -97,6 +108,17 @@ impl PyHarnessSession {
         .map_err(PyValueError::new_err)
     }
 
+    fn export_conversation(&self, py: Python<'_>, fork_turns: &str) -> PyResult<String> {
+        let engine = Arc::clone(&self.engine);
+        let handle = self.required_handle()?;
+        let fork_turns = fork_turns.to_owned();
+        py.detach(move || {
+            let conversation = engine.export_conversation(handle, &fork_turns)?;
+            encode_json(&conversation)
+        })
+        .map_err(PyValueError::new_err)
+    }
+
     fn close(&mut self, py: Python<'_>) -> PyResult<()> {
         let Some(handle) = self.handle.take() else {
             return Ok(());
@@ -124,7 +146,14 @@ impl Drop for PyHarnessSession {
 
 pub(crate) fn register(module: &Bound<'_, PyModule>) -> PyResult<()> {
     module.add_class::<PyHarnessSession>()?;
-    module.add_function(wrap_pyfunction!(hook_tool_catalog, module)?)
+    module.add_function(wrap_pyfunction!(hook_tool_catalog, module)?)?;
+    module.add_function(wrap_pyfunction!(validate_permission_pattern, module)?)
+}
+
+#[pyfunction]
+#[pyo3(signature = (pattern, *, arguments = false))]
+fn validate_permission_pattern(pattern: &str, arguments: bool) -> PyResult<()> {
+    crate::core::validate_permission_pattern(pattern, arguments).map_err(PyValueError::new_err)
 }
 
 #[pyfunction]

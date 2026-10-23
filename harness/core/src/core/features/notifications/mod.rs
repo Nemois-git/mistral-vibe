@@ -107,6 +107,20 @@ impl NotificationState {
         self.ready_for_model = false;
         self.pending_bytes = 0;
         let notifications = std::mem::take(&mut self.pending);
+        // The Runtime's process record, not Core, keeps a delivered process
+        // notification from being submitted again.
+        let delivered_process_ids = notifications
+            .iter()
+            .filter(|entry| {
+                matches!(
+                    entry.notification.source,
+                    NotificationSource::BackgroundProcess { .. }
+                )
+            })
+            .map(|entry| entry.notification.id.as_str())
+            .collect::<BTreeSet<_>>();
+        self.received_ids
+            .retain(|id| !delivered_process_ids.contains(id.as_str()));
         self.retain_recent(recent_limit);
         notifications
     }
@@ -229,7 +243,11 @@ fn validate_stored_notification(notification: &Notification) -> Result<(), CoreE
         ));
     }
     if let Some(message) = attributed_agent_context(notification) {
-        render_agent_message(message)?;
+        render_agent_message(
+            message,
+            &crate::core::prompt::PromptSettings::default().agent_messages,
+            true,
+        )?;
         return Ok(());
     }
     match &notification.source {
@@ -273,6 +291,8 @@ fn attributed_agent_context(notification: &Notification) -> Option<AgentMessageC
 
 pub(crate) fn notification_messages(
     notifications: &[Notification],
+    settings: &crate::core::helpers::AgentMessageSettings,
+    continue_hint: bool,
 ) -> Result<Vec<StoredMessage>, CoreError> {
     let mut messages = Vec::new();
     let mut content = Vec::new();
@@ -284,7 +304,7 @@ pub(crate) fn notification_messages(
                 ))));
             }
             messages.push(StoredMessage::injected(Message::user(
-                render_agent_message(message)?,
+                render_agent_message(message, settings, continue_hint)?,
             )));
             continue;
         }

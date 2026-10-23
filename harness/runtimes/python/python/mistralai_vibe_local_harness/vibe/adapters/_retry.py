@@ -42,26 +42,37 @@ async def call_with_retries[T](
     max_elapsed_time_s: float,
     notices: RetryNotices,
 ) -> T:
-    """Run ``attempt`` until it succeeds, fails for good, or the budget is spent.
+    """Run ``attempt`` until it succeeds, fails for good, or its retries are spent.
 
     The budget bounds when a new attempt may start, not how long one may run:
     a retry whose wait would end after the budget is not made. The wait checked
     is the one the provider asked for, before the delay cap shortens it, since
-    an attempt the provider said would fail is not worth making early. A stall is
-    retried at most ``_MAX_STALL_RETRIES`` times: when the silence was a long
+    an attempt the provider said would fail is not worth making early. A budget
+    of zero disables retries.
+
+    A stall is retried at most ``_MAX_STALL_RETRIES`` times, and a nonzero
+    budget does not bound that retry: a stall is noticed only after the stream
+    idle limit or the transport read timeout, either of which can be longer than
+    the whole budget. The cap is low because when the silence was a long
     generation the provider does not stream, every attempt repeats it, and each
-    one is paid for.
+    one is paid for. A response whose tool calls all lack a name is retried at
+    most ``_MAX_UNUSABLE_TOOL_CALL_RETRIES`` times for the same reason.
     """
     started = time.monotonic()
     retry_attempt = 0
     stall_retries = 0
+    unusable_tool_call_retries = 0
     while True:
         try:
             return await attempt()
         except Exception as error:
             failure = read_provider_failure(error)
             stalls_spent = failure.stalled and stall_retries >= _MAX_STALL_RETRIES
-            if stalls_spent or not failure.retryable:
+            unusable_spent = (
+                failure.unusable_tool_calls
+                and unusable_tool_call_retries >= _MAX_UNUSABLE_TOOL_CALL_RETRIES
+            )
+            if stalls_spent or unusable_spent or not failure.retryable:
                 raise
             wait_s = _requested_wait_s(
                 failure,
@@ -69,11 +80,15 @@ async def call_with_retries[T](
                 now=datetime.now(UTC),
                 jitter_s=random.uniform(0, _MAX_RETRY_JITTER_S),
             )
-            if time.monotonic() - started + wait_s > max_elapsed_time_s:
+            budget_spent = time.monotonic() - started + wait_s > max_elapsed_time_s
+            stall_exempt = failure.stalled and max_elapsed_time_s > 0
+            if budget_spent and not stall_exempt:
                 raise
             delay_s = min(wait_s, _MAX_RETRY_DELAY_S)
             if failure.stalled:
                 stall_retries += 1
+            if failure.unusable_tool_calls:
+                unusable_tool_call_retries += 1
             retry_attempt += 1
             logger.warning(
                 "Retrying model completion (attempt %d, delay %.2fs): %r",
@@ -122,6 +137,7 @@ _RETRY_BACKOFF = 1.5
 _MAX_RETRY_DELAY_S = 30.0
 _MAX_RETRY_JITTER_S = 1.0
 _MAX_STALL_RETRIES = 1
+_MAX_UNUSABLE_TOOL_CALL_RETRIES = 1
 # The backoff reaches its maximum long before this exponent; the cap keeps a
 # large retry budget from overflowing the power.
 _MAX_BACKOFF_EXPONENT = 16

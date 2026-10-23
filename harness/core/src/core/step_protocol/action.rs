@@ -2,8 +2,7 @@ use serde::Deserialize;
 use serde::Serialize;
 use serde_json::Value;
 
-use crate::core::error::CoreError;
-use crate::core::features::compaction::CompactionTrigger;
+use crate::core::features::compaction::{CompactionRequestKind, CompactionTrigger};
 use crate::core::features::permissions::GrantKey;
 use crate::core::features::permissions::PublicArguments;
 use crate::core::hooks::HookCall;
@@ -27,6 +26,10 @@ pub(crate) enum CompletionActionKind {
         compaction_id: String,
         trigger: CompactionTrigger,
         attempt: u32,
+        /// Omitted for the in-context request, so a Runtime that predates the
+        /// standalone fallback still reads every first compaction request.
+        #[serde(default, skip_serializing_if = "CompactionRequestKind::is_in_context")]
+        request: CompactionRequestKind,
     },
 }
 
@@ -195,25 +198,6 @@ impl Action {
                 call: call.call.provided_call().expect("matched provided call"),
             },
         }
-    }
-
-    pub(crate) fn hook(
-        effect_id: String,
-        turn_id: &str,
-        hook_binding_ids: Vec<String>,
-        call: HookCall,
-    ) -> Result<Self, CoreError> {
-        if hook_binding_ids.is_empty() {
-            return Err(CoreError::invariant(
-                "cannot emit a hook action without matching bindings",
-            ));
-        }
-        Ok(Self::Hook {
-            effect_id,
-            turn_id: turn_id.to_string(),
-            hook_binding_ids,
-            call,
-        })
     }
 
     pub(crate) fn filesystem_write(

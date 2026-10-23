@@ -1,8 +1,15 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable, Iterable, Mapping, Sequence, Set as AbstractSet
-from dataclasses import dataclass, field
+from collections.abc import (
+    Awaitable,
+    Callable,
+    Iterable,
+    Mapping,
+    Sequence,
+    Set as AbstractSet,
+)
+from dataclasses import dataclass, field, replace
 from enum import StrEnum, auto
 import hashlib
 import json
@@ -19,18 +26,28 @@ from vibe._experimental_harness import (
     create_experimental_harness_host,
     runtime_startup_error,
 )
+from vibe.app_server._admin_config import (
+    OrgConfigAttempt,
+    OrgConfigReport,
+    OrgConfigSource,
+    fetch_admin_toml,
+    load_fetched_admin_config,
+)
 from vibe.app_server._agent_types import (
     AgentToolCatalogue,
     resolve_agent_types,
     workspace_agent_types,
 )
+from vibe.app_server._cached_layers import apply_cached_layers
 from vibe.app_server._client_provided_tools import (
     ClientProvidedTools,
     ClientToolDeclarationError,
     ClientTools,
 )
 from vibe.app_server._host import HostRequestHandler
+from vibe.app_server._ignored_tool_settings import ignored_tool_settings
 from vibe.app_server._imports import build_local_imports_service
+from vibe.app_server._launch_context import client_launch_context
 from vibe.app_server._legacy_import import LegacySessionStore
 from vibe.app_server._projection import (
     project_agent_summaries,
@@ -41,13 +58,11 @@ from vibe.app_server._provided_tools import vibe_tool_groups
 from vibe.app_server._session_backend_port import SessionBackendHost
 from vibe.app_server._session_backend_services import SessionBackendServices
 from vibe.app_server._session_model import active_model_is_pinned
+from vibe.app_server._session_spawn import spawn_models
 from vibe.app_server._skills import discover_session_skills
 from vibe.app_server.client import AppServerClient
 from vibe.app_server.client_tools import ClientToolHandler
-from vibe.app_server.connector_catalog import (
-    ConnectorCatalogError,
-    ConnectorCatalogService,
-)
+from vibe.app_server.connector_catalog import ConnectorCatalogService
 from vibe.app_server.models import (
     AgentStatsSnapshot,
     ConfigIssue,
@@ -81,16 +96,13 @@ from vibe.core.config import (
     build_default_orchestrator,
     resolve_api_key,
 )
+from vibe.core.config.admin_config import AdminConfigApplyResult, AdminConfigOutcome
 from vibe.core.config.harness_files import HarnessFilesManager
-from vibe.core.config.layers.growthbook import GrowthbookLayer
-from vibe.core.config.layers.model_catalog import apply_cached_model_catalog
+from vibe.core.config.layers.admin import enforced_keys
+from vibe.core.config.managed_config_cache import store_cached_managed_config
 from vibe.core.config.orchestrator import ConfigOrchestrator
-from vibe.core.experiments.cache import load_cached_eval_response
 from vibe.core.experiments.client import RemoteEvalClient
-from vibe.core.experiments.manager import (
-    ExperimentManager,
-    config_variants_from_response,
-)
+from vibe.core.experiments.manager import ExperimentManager
 from vibe.core.hooks.config import load_hooks_file, load_hooks_from_fs
 from vibe.core.hooks.models import HookConfigResult
 from vibe.core.llm.utility_completion import (
@@ -107,9 +119,8 @@ from vibe.core.system_prompt import (
     get_commit_signature_section,
     git_bash_form,
 )
-from vibe.core.telemetry.build_metadata import build_launch_context
 from vibe.core.telemetry.types import LaunchContext
-from vibe.core.tools.manager import ToolManager
+from vibe.core.tools.manager import FailedToolFile, ToolManager
 from vibe.core.tools.models import ToolPermission
 from vibe.core.tools.permissions import PermissionStore
 from vibe.core.utils import get_windows_bash_path, is_windows
@@ -120,6 +131,12 @@ from vibe.utils.http import get_server_url_from_api_base
 from vibe.utils.paths import is_dangerous_directory
 
 _SHORT_SESSION_ID_LENGTH = 8
+# A tool result past about 16,000 characters is saved to a file, and the model
+# gets its first and last 4,000 or so with the file's path. The Harness Core
+# counts about four characters a token. The gap between the two keeps a result
+# just over the threshold from being saved for little gain.
+_LARGE_OUTPUT_MAX_TOKENS = 4_000
+_LARGE_OUTPUT_VISIBLE_TOKENS = 2_000
 type _CommandEnvironmentMode = Literal["unix", "git_bash", "powershell"]
 
 
@@ -281,13 +298,11 @@ def _build_launch_context_from_services(
         client_info = services.client_info()
     except RuntimeError:
         return None
-    return build_launch_context(
-        agent_entrypoint=client_info.entrypoint,
-        agent_version=__version__,
-        client_name=client_info.name,
-        client_version=client_info.version,
-        terminal_emulator=client_info.terminal_emulator,
-    )
+    return client_launch_context(client_info)
+
+
+def session_spawner_for(services: SessionBackendServices) -> SessionSpawner | None:
+    return services if services.client_capabilities().session_spawn else None
 
 
 def _auto_titles_enabled(config: VibeConfigSchema, entrypoint: str) -> bool:
@@ -367,9 +382,12 @@ if TYPE_CHECKING:
     from vibe.app_server._mcp_auth import MCPAuthenticationService
     from vibe.app_server._plugin_mcp import PluginMCPCatalog
     from vibe.app_server._plugins import SessionPlugins, UnifiedPluginProvider
+    from vibe.app_server._process_settings import ProcessSettings
     from vibe.app_server._sandbox_skills import SandboxSkills
     from vibe.app_server._sandbox_workspace import SandboxWorkspaceContext
     from vibe.app_server._session_backend_port import ResolvedMCPCatalog
+    from vibe.app_server._session_spawn import SessionSpawner
+    from vibe.app_server._subagent_permissions import SubagentPermissions
     from vibe.app_server._unified_harness_backend_adapter import (
         UnifiedReadContext,
         UnifiedSessionContext,
@@ -542,6 +560,10 @@ class LocalHarnessOptions:
     # Vibe's own. Internal: nothing on the wire declares them. Requires the
     # Unified Harness.
     client_tools: ClientTools | None = field(default=None, kw_only=True)
+    # The user config to read in place of the user config file, as the parsed
+    # TOML document. Saves to it stay in memory. Internal: an embedding host
+    # serving many runs gives each its own.
+    user_config: Mapping[str, Any] | None = field(default=None, kw_only=True)
     # Project instructions the embedding host gives every session, shown to
     # the model ahead of the project's AGENTS.md docs. Requires the Unified
     # Harness.
@@ -552,6 +574,8 @@ class LocalHarnessOptions:
 class _SessionConfig:
     config_orchestrator: ConfigOrchestrator[VibeConfigSchema]
     harness_files: HarnessFilesManager
+    managed_config_cache_key: str | None
+    org_config: OrgConfigAttempt
 
 
 # The harness always binds a session to a concrete on-disk store: there is no
@@ -678,8 +702,11 @@ class HarnessProcess:
         shared: bool = False,
         sandbox: SandboxAdapter | None = None,
         client_tools: ClientTools | None = None,
+        user_config: Mapping[str, Any] | None = None,
         project_instructions: str | None = None,
         agent_socket: AgentSocketMount | None = None,
+        credentials: Mapping[str, str] | None = None,
+        process_settings: ProcessSettings | None = None,
     ) -> None:
         from vibe.app_server._mcp_auth import MCPAuthenticationService
         from vibe.app_server._plugins import packaged_builtin_plugin_roots
@@ -689,6 +716,12 @@ class HarnessProcess:
         # The agent server's sandbox, tools and instructions, when the
         # handshake succeeded; otherwise every session open reports its failure.
         self._agent_socket = agent_socket
+        # A run's own API keys, by environment variable name: they resolve
+        # before this process's, for its model calls only.
+        self._credentials = credentials
+        # What this process applies to every run, which a session's config
+        # must agree with.
+        self._process_settings = process_settings
         if agent_socket is not None and agent_socket.agent_socket is not None:
             sandbox = agent_socket.agent_socket.sandbox
             client_tools = agent_socket.agent_socket.client_tools()
@@ -705,6 +738,8 @@ class HarnessProcess:
         self.harness_files = harness_files or HarnessFilesManager(
             sources=("user",) if sandbox is not None else ("user", "project")
         )
+        if user_config is not None:
+            self.harness_files = replace(self.harness_files, user_config=user_config)
         self._sandbox = sandbox
         # The tool helper's crashes in a row in the sandbox, counted across
         # this process's sessions, as they share the sandbox. Made with the
@@ -756,6 +791,7 @@ class HarnessProcess:
         self.host_handler = HostRequestHandler(
             self.harness_files,
             image_fallback=self._experimental_harness_host is not None,
+            builtin_plugin_roots=self._builtin_plugin_roots,
         )
         self.mcp_authentication = MCPAuthenticationService()
         self.mcp_catalog = MCPCatalogService(
@@ -776,9 +812,25 @@ class HarnessProcess:
 
         if self._agent_socket is not None:
             self._agent_socket.subscribe(services.notify)
+
+        def build_session_context(
+            options: SessionOptions,
+            *,
+            require_api_key: bool = True,
+            entrypoint: AgentEntrypoint = "cli",
+            org_config: OrgConfigSource,
+        ) -> Awaitable[UnifiedSessionContext]:
+            return self.build_unified_session_context(
+                options,
+                require_api_key=require_api_key,
+                entrypoint=entrypoint,
+                org_config=org_config,
+                session_spawner=session_spawner_for(services),
+            )
+
         return adapt_harness_host(
             host,
-            self.build_unified_session_context,
+            build_session_context,
             services,
             pin_session_options=None
             if self._agent_socket is None
@@ -851,7 +903,7 @@ class HarnessProcess:
         def build_agents() -> AgentManager:
             return AgentManager(
                 config_orchestrator,
-                options.agent or config_orchestrator.config.resolve_default_agent(),
+                options.agent,
                 harness_files=session_config.harness_files,
             )
 
@@ -860,23 +912,99 @@ class HarnessProcess:
                 config_orchestrator.config.session_logging
             ),
             config_orchestrator=config_orchestrator,
+            harness_files=session_config.harness_files,
             legacy_source_loader=legacy_store.loader(),
             legacy_source_resolver=legacy_store.resolver(),
             build_agents=build_agents,
         )
 
-    async def build_unified_session_context(  # noqa: PLR0914, PLR0915 - composition root
+    async def build_unified_session_context(
         self,
         options: SessionOptions,
         *,
         require_api_key: bool = True,
         entrypoint: AgentEntrypoint = "cli",
+        org_config: OrgConfigSource = OrgConfigSource.CACHED,
+        session_spawner: SessionSpawner | None = None,
+    ) -> UnifiedSessionContext:
+        """Build a session context; no build fails because of the org config.
+
+        ``org_config`` is ``FETCHED`` for a session start: the context is built
+        from the org config the server answers now. Every other build uses the
+        cached copy. When the session cannot be built or run under it, the
+        build falls back to the cached copy (from a fetched one), then to local
+        config, never building the same org config twice. A failure with no
+        org config applied is the local config's, and propagates. Nothing is
+        removed from the cache: the failure can be this project's or this
+        user's local config, not the org config's. The context carries the
+        report for the session to publish.
+        """
+        source = org_config
+        error: Exception | None = None
+        first: OrgConfigAttempt | None = None
+        while True:
+            session_config = await self._build_session_config(
+                options, org_config=source, check_process_settings=False
+            )
+            applied = session_config.org_config
+            first = first or applied
+            try:
+                if self._process_settings is not None:
+                    self._process_settings.check(
+                        session_config.config_orchestrator.config
+                    )
+                context = await self._build_unified_session_context_once(
+                    options,
+                    session_config,
+                    require_api_key=require_api_key,
+                    entrypoint=entrypoint,
+                    session_spawner=session_spawner,
+                )
+                await _accept_org_config(context, applied)
+                break
+            except Exception as exc:
+                # A context the Core check rejected is dropped without being
+                # closed: nothing in it is open yet. Its experiment client
+                # connects on the first evaluation, after the session opens,
+                # and the MCP auth service holds its bindings by weak reference.
+                retry = applied.next_source()
+                if retry is None:
+                    raise
+                error = error or exc
+                source = retry
+        outcome = fetch_outcome = first.fetch_outcome
+        if error is not None:
+            logger.warning("Org config rejected by the session", exc_info=error)
+            outcome = AdminConfigApplyResult(
+                AdminConfigOutcome.APPLY_FAILED, error=str(error)
+            )
+            if first.fetched is not None:
+                # The first build ran under the fetched answer and failed.
+                fetch_outcome = outcome
+        elif (cache_failure := applied.cache_failure) is not None:
+            outcome = cache_failure
+        context.org_config_report.report = OrgConfigReport(
+            outcome,
+            excluded_agent=context.agents.excluded_agent,
+            fetch_outcome=fetch_outcome,
+        )
+        return context
+
+    async def _build_unified_session_context_once(  # noqa: PLR0914, PLR0915 - composition root
+        self,
+        options: SessionOptions,
+        session_config: _SessionConfig,
+        *,
+        require_api_key: bool,
+        entrypoint: AgentEntrypoint,
+        session_spawner: SessionSpawner | None,
     ) -> UnifiedSessionContext:
         from mistralai_vibe_local_harness import HarnessSession
         from mistralai_vibe_local_harness.protocol import (
             RustAutomaticCompactionPolicy,
             RustContextSettings,
             RustDisabledCompactionPolicy,
+            RustDisabledOutputLimitRecovery,
             RustDisabledRuntimeToolFeature,
             RustEnabledAgentTools,
             RustEnabledModelWait,
@@ -889,6 +1017,7 @@ class HarnessProcess:
             RustPowerShellCommandEnvironment,
             RustProgrammaticToolSettings,
             RustProvidedToolDefinition,
+            RustRetryOutputLimitRecovery,
             RustToolGroupDefinition,
             RustToolSettings,
             RustTurnSettings,
@@ -913,8 +1042,11 @@ class HarnessProcess:
 
         # Import the provider service after loading the bundled Harness package.
         from vibe.app_server._provider_credentials import ProviderCredentialService
+        from vibe.app_server._subagent_permissions import SubagentPermissions
+        from vibe.app_server._subagent_runs import SubagentSteps
         from vibe.app_server._unified_harness_backend_adapter import (
             CorrelationIdHolder,
+            MalformedToolCallsQueue,
             RequestSentQueue,
             UnifiedRuntimeDerivation,
             UnifiedSessionContext,
@@ -938,6 +1070,7 @@ class HarnessProcess:
             supports_images: bool,
             top_p: float | None = None,
             max_output_tokens: int | None = None,
+            context_window: int | None = None,
         ) -> LocalModelRoute:
             route_kwargs: dict[str, object] = {
                 "model": model,
@@ -951,6 +1084,7 @@ class HarnessProcess:
                 "supports_images": supports_images,
                 "top_p": top_p,
                 "max_output_tokens": max_output_tokens,
+                "context_window": context_window,
             }
             for name, value in optional_fields.items():
                 if name in route_fields:
@@ -964,6 +1098,10 @@ class HarnessProcess:
             compaction_supports_images: bool,
         ) -> RustContextSettings:
             context_kwargs: dict[str, object] = {"compaction": compaction}
+            # The local Runtime shapes the standalone compaction request, so
+            # Core may fall back to it after a failed in-context attempt.
+            if "compaction_fallback" in context_settings_fields:
+                context_kwargs["compaction_fallback"] = "standalone"
             if "image_delivery" in context_settings_fields:
                 context_kwargs["image_delivery"] = {
                     "agent": "native" if agent_supports_images else "resource_link",
@@ -973,11 +1111,16 @@ class HarnessProcess:
                 }
             if "image_token_cost" in context_settings_fields:
                 context_kwargs["image_token_cost"] = "fixed"
+            if "input_modalities" in context_settings_fields:
+                # One shared list for both completion purposes; the compaction
+                # model's own image support only steers image delivery.
+                context_kwargs["input_modalities"] = (
+                    ["text", "image"] if agent_supports_images else ["text"]
+                )
             return context_settings_type(**context_kwargs)
 
         from vibe.questions import UserQuestionRequest, UserQuestionResult
 
-        session_config = await self._build_session_config(options)
         config_orchestrator = session_config.config_orchestrator
         harness_files = session_config.harness_files
         config = config_orchestrator.config
@@ -1014,9 +1157,7 @@ class HarnessProcess:
         # read the orchestrator lazily, so they stay correct across every config
         # mutation and must outlive any single derivation.
         agents = AgentManager(
-            config_orchestrator,
-            options.agent or config.resolve_default_agent(),
-            harness_files=harness_files,
+            config_orchestrator, options.agent, harness_files=harness_files
         )
         # Derivation reads the probe's answer synchronously, so it must finish
         # first. Only features on at open are probed; one turned on later falls
@@ -1031,13 +1172,47 @@ class HarnessProcess:
             )
             if enabled
         )
-        (plugins, plugin_provider, plugin_mcp), _ = await asyncio.gather(
-            self._build_plugins(session_config, workspace.cwd, agents=agents),
-            ensure_utility_models_probed(config, features=probe_features),
-        )
         # A sandbox is a POSIX environment whatever the host runs.
         command_environment_mode: _CommandEnvironmentMode = (
             "unix" if sandbox is not None else _command_environment_mode()
+        )
+        # The store is the session's memory of what the user approved
+        permissions = PermissionStore()
+
+        def session_tools(config_getter: Callable[[], VibeConfigSchema]) -> ToolManager:
+            return ToolManager(
+                config_getter,
+                defer_mcp=True,
+                cwd=workspace.cwd,
+                harness_files=harness_files,
+                permission_getter=permissions.get_tool_permission,
+            )
+
+        # The MCP and connector projections write the routes they published into
+        # this map; the resolver reads it to find the name they were configured
+        # under. Both need the same instance, so the context carries it.
+        provided_names = ProvidedToolNames()
+        permission_resolver = UnifiedPermissionResolver(
+            session_tools(lambda: config_orchestrator.config),
+            permissions,
+            config_orchestrator,
+            provided_names,
+            path_space=workspace.path_space,
+            command_environment=command_environment_mode,
+        )
+        # Built before the plugins, which hand each declared subagent profile the
+        # resolver its calls go through.
+        subagent_permissions = SubagentPermissions(
+            permission_resolver, config_orchestrator, session_tools
+        )
+        (plugins, plugin_provider, plugin_mcp), _ = await asyncio.gather(
+            self._build_plugins(
+                session_config,
+                workspace.cwd,
+                agents=agents,
+                subagent_permissions=subagent_permissions,
+            ),
+            ensure_utility_models_probed(config, features=probe_features),
         )
         match command_environment_mode:
             case "unix":
@@ -1050,7 +1225,9 @@ class HarnessProcess:
         # Constructed once per session rather than per derivation: it holds the
         # set of revisions a provider has refused, and a service rebuilt on
         # every derivation would forget them and re-send a rejected key.
-        credentials = ProviderCredentialService(config_orchestrator)
+        credentials = ProviderCredentialService(
+            config_orchestrator, credentials=self._credentials
+        )
 
         # A route's endpoint is fixed at derivation, so its key is pinned to the
         # same provider. Per session, like ``credentials``, so rejection memory
@@ -1060,7 +1237,9 @@ class HarnessProcess:
         def credentials_for(provider_name: str) -> ProviderCredentialService:
             if provider_name not in utility_credentials:
                 utility_credentials[provider_name] = ProviderCredentialService(
-                    config_orchestrator, select_provider=_named_provider(provider_name)
+                    config_orchestrator,
+                    select_provider=_named_provider(provider_name),
+                    credentials=self._credentials,
                 )
             return utility_credentials[provider_name]
 
@@ -1072,6 +1251,10 @@ class HarnessProcess:
         # Same lifetime and sharing as ``correlation``: the completion adapter
         # appends each request's shape here, the adapter drains it to telemetry.
         request_sent = RequestSentQueue()
+        malformed_tool_calls = MalformedToolCallsQueue()
+        # The root and its subagents share the sink: it counts each subagent's
+        # agent model calls for ``session/subagents/read``.
+        subagent_steps = SubagentSteps()
 
         if require_api_key:
             config_orchestrator.config.require_active_provider_api_key()
@@ -1121,28 +1304,6 @@ class HarnessProcess:
                 # it: some, such as the git context, swallow their failures.
                 if self._agent_socket is not None:
                     self._agent_socket.check()
-        # The store is the session's memory of what the user approved
-        permissions = PermissionStore()
-        tools = ToolManager(
-            lambda: config_orchestrator.config,
-            defer_mcp=True,
-            cwd=workspace.cwd,
-            harness_files=harness_files,
-            permission_getter=permissions.get_tool_permission,
-        )
-        # The MCP and connector projections write the routes they published into
-        # this map; the resolver reads it to find the name they were configured
-        # under. Both need the same instance, so the context carries it.
-        provided_names = ProvidedToolNames()
-        permission_resolver = UnifiedPermissionResolver(
-            tools,
-            permissions,
-            config_orchestrator,
-            provided_names,
-            path_space=workspace.path_space,
-            command_environment=command_environment_mode,
-        )
-
         legacy_store = LegacySessionStore(config_orchestrator.config)
 
         # Discover the user's hooks once. The raw parse -- including any parse/duplicate
@@ -1235,7 +1396,9 @@ class HarnessProcess:
                 harness_files=harness_files,
             )
             available_tools = set(derived_tools.available_tools)
-            bypass_approval = options.auto_approve or config.bypass_tool_permissions
+            bypass_approval = _effective_bypass_tool_permissions(
+                config, options.auto_approve
+            )
             # Recomputed on every derivation (including switch_agent) so entering or
             # leaving smart-approve mid-session re-derives the gate live.
             smart_approve = agents.active_profile.name == BuiltinAgentName.SMART_APPROVE
@@ -1282,6 +1445,13 @@ class HarnessProcess:
                         *agent_types.issues,
                         *([prompt_issue] if prompt_issue is not None else []),
                         *_hook_config_issues(hook_result),
+                        *_custom_tool_issues(derived_tools.failed_custom_tool_files),
+                        *ignored_tool_settings(config, derived_tools.search_paths),
+                        *(
+                            self._process_settings.issues(config)
+                            if self._process_settings is not None
+                            else []
+                        ),
                     ],
                     skills=skills.catalogue,
                     tools=available_tools,
@@ -1303,7 +1473,18 @@ class HarnessProcess:
                         project_instructions=self._project_instructions,
                     ),
                     settings=RustHarnessSettings(
-                        turn=RustTurnSettings(max_iterations=max_iterations),
+                        turn=RustTurnSettings(
+                            max_iterations=max_iterations,
+                            # A cut-off answer is discarded and asked for again
+                            # with feedback, at most this many times a turn.
+                            output_limit_recovery=(
+                                RustRetryOutputLimitRecovery(
+                                    max_retries=config.output_limit_retries
+                                )
+                                if config.output_limit_retries > 0
+                                else RustDisabledOutputLimitRecovery()
+                            ),
+                        ),
                         context=core_context_settings(
                             compaction=compaction_policy,
                             agent_supports_images=active_model.supports_images,
@@ -1311,9 +1492,9 @@ class HarnessProcess:
                         ),
                         tools=RustToolSettings(
                             # The local Runtime answers `self.wait` from committed
-                            # Session input (steering and process completions).
-                            # Core offers the direct `wait` tool only when
-                            # subagents or background processes are enabled.
+                            # Session input (steering, child results, process
+                            # completions). Core offers the direct `wait` tool only
+                            # when subagents or background processes are enabled.
                             model_wait=RustEnabledModelWait(),
                             programmatic=RustProgrammaticToolSettings(
                                 max_effects=128,
@@ -1322,7 +1503,7 @@ class HarnessProcess:
                                 max_sleep_ms=30_000,
                             ),
                             subagents=(
-                                RustEnabledAgentTools()
+                                RustEnabledAgentTools(conversation_forking=False)
                                 if config.enable_subagents
                                 else RustDisabledRuntimeToolFeature()
                             ),
@@ -1332,7 +1513,10 @@ class HarnessProcess:
                                 else RustDisabledRuntimeToolFeature()
                             ),
                             command_environment=command_environment,
-                            large_output=RustFilesystemLargeOutputPolicy(),
+                            large_output=RustFilesystemLargeOutputPolicy(
+                                max_output_tokens=_LARGE_OUTPUT_MAX_TOKENS,
+                                model_visible_output_tokens=_LARGE_OUTPUT_VISIBLE_TOKENS,
+                            ),
                         ),
                     ),
                     capabilities=RustHarnessCapabilitySet(
@@ -1363,6 +1547,11 @@ class HarnessProcess:
                                 available_tools,
                                 enabled_tools=config.enabled_tools,
                                 disabled_tools=config.disabled_tools,
+                                session_spawn=(
+                                    spawn_models(config)
+                                    if session_spawner is not None
+                                    else None
+                                ),
                             ),
                             # The client chose these; the tool filters are for
                             # Vibe's own.
@@ -1392,6 +1581,7 @@ class HarnessProcess:
                         supports_images=active_model.supports_images,
                         top_p=active_model.top_p,
                         max_output_tokens=active_model.max_output_tokens,
+                        context_window=active_model.max_context_length,
                     ),
                     active_agent=agents.active_profile.name,
                     compaction_model=local_model_route(
@@ -1401,6 +1591,7 @@ class HarnessProcess:
                         supports_images=compaction_model.supports_images,
                         top_p=compaction_model.top_p,
                         max_output_tokens=compaction_model.max_output_tokens,
+                        context_window=compaction_model.max_context_length,
                     ),
                     title_model=title_model if auto_title_enabled else None,
                     title_prompt=title_prompt,
@@ -1422,6 +1613,17 @@ class HarnessProcess:
                     # the turn's model, which matches the turn's provider.
                     classifier_model=classifier_model_config.name,
                     max_tokens=settings.max_tokens,
+                    # 0 is how a TOML file turns each of these off.
+                    compaction_max_output_tokens=(
+                        config.compaction_max_output_tokens or None
+                    ),
+                    compaction_thinking=config.compaction_thinking,
+                    compaction_reasoning_limit_tokens=(
+                        config.compaction_reasoning_limit_tokens or None
+                    ),
+                    output_token_reserve=config.output_token_reserve,
+                    subagent_max_children=config.max_subagents,
+                    subagent_max_concurrent_turns=config.max_concurrent_subagents,
                     thinking=active_model.thinking,
                     reasoning_field_name=provider.reasoning_field_name,
                     emits_finish_reason=provider.emits_finish_reason,
@@ -1432,6 +1634,7 @@ class HarnessProcess:
                     # 0 is how a TOML file turns the limit off.
                     stream_idle_timeout_s=config.api_stream_idle_timeout or None,
                     retry_max_elapsed_time_s=config.api_retry_max_elapsed_time,
+                    enable_system_trust_store=config.enable_system_trust_store,
                     workspace=workspace,
                     # The library environment goes on top: a plugin that declares a
                     # Python or Node library is only usable if the search paths
@@ -1473,7 +1676,8 @@ class HarnessProcess:
                     permission_resolver=permission_resolver.resolve,
                     skills=skills.model_payloads,
                     correlation_id_sink=correlation.record,
-                    request_sent_sink=request_sent.record,
+                    request_sent_sink=subagent_steps.counting(request_sent.record),
+                    malformed_tool_calls_sink=malformed_tool_calls.record,
                     sandbox=sandbox,
                     helper_crashes=helper_crashes,
                 ),
@@ -1527,10 +1731,12 @@ class HarnessProcess:
             config_orchestrator=config_orchestrator,
             harness_files=harness_files,
             agents=agents,
+            managed_config_cache_key=session_config.managed_config_cache_key,
             derive=derive,
             permissions=permission_resolver,
             provided_names=provided_names,
             client_tools=self._client_tools,
+            session_spawner=session_spawner,
             hooks=hooks,
             mcp_catalog=mcp_catalog,
             mcp_authorization_provider=self.mcp_authentication,
@@ -1559,6 +1765,8 @@ class HarnessProcess:
             ),
             correlation=correlation,
             request_sent=request_sent,
+            malformed_tool_calls=malformed_tool_calls,
+            subagent_steps=subagent_steps,
         )
 
     def _session_cwd(self, options: SessionOptions) -> Path:
@@ -1569,7 +1777,16 @@ class HarnessProcess:
             return sandbox_path(options.cwd or workspace, cwd=workspace)
         return Path(options.cwd or Path.cwd()).expanduser().resolve()
 
-    async def _build_session_config(self, options: SessionOptions) -> _SessionConfig:
+    async def _build_session_config(
+        self,
+        options: SessionOptions,
+        *,
+        org_config: OrgConfigSource = OrgConfigSource.CACHED,
+        check_process_settings: bool = True,
+    ) -> _SessionConfig:
+        """``check_process_settings=False`` leaves the process-settings check to
+        the caller: a session build runs it where it can fall back.
+        """
         if self._agent_socket is not None:
             self._agent_socket.check()
         cwd = self._session_cwd(options)
@@ -1598,19 +1815,46 @@ class HarnessProcess:
         config_orchestrator = await build_default_orchestrator(
             overrides, harness_files=harness_files
         )
-        await _apply_cached_experiment_variants(config_orchestrator)
-        await apply_cached_model_catalog(config_orchestrator)
+        cache_key, saved, saved_failure = await apply_cached_layers(
+            config_orchestrator, org_config=org_config is not OrgConfigSource.NONE
+        )
+        # A session start is built from the org config the server answers now,
+        # loaded over the cached copy above, which is only what a failed fetch
+        # falls back to. Reads outside a session never fetch, except the
+        # picker's config reads when the cache holds nothing.
+        fetch_outcome = fetched = None
+        if org_config is OrgConfigSource.FETCHED:
+            fetch_outcome, fetched = await load_fetched_admin_config(
+                config_orchestrator, await fetch_admin_toml(config_orchestrator)
+            )
+        # After the org config: it can set the process-wide trust store too.
+        if check_process_settings and self._process_settings is not None:
+            self._process_settings.check(config_orchestrator.config)
         # Every session crosses this config build, and the unified harness
         # never constructs the legacy agent loop, so the sweep starts here.
         start_restrict_session_log_permissions(
             config_orchestrator.config.session_logging
         )
         return _SessionConfig(
-            config_orchestrator=config_orchestrator, harness_files=harness_files
+            config_orchestrator=config_orchestrator,
+            harness_files=harness_files,
+            managed_config_cache_key=cache_key,
+            org_config=OrgConfigAttempt(
+                org_config,
+                saved=saved,
+                fetched=fetched,
+                fetch_outcome=fetch_outcome,
+                saved_failure=saved_failure,
+            ),
         )
 
     async def _build_plugins(
-        self, session_config: _SessionConfig, cwd: Path, *, agents: AgentManager
+        self,
+        session_config: _SessionConfig,
+        cwd: Path,
+        *,
+        agents: AgentManager,
+        subagent_permissions: SubagentPermissions,
     ) -> tuple[SessionPlugins, UnifiedPluginProvider, PluginMCPCatalog]:
         """The Host's own resolve, and the provider the Runtime binds through.
 
@@ -1650,6 +1894,7 @@ class HarnessProcess:
             return AgentToolCatalogue(
                 available=frozenset(tools.available_tools),
                 permission_of=lambda name: tools.get_tool_config(name).permission,
+                permission_resolver=subagent_permissions.resolver_for,
             )
 
         return (
@@ -1715,11 +1960,10 @@ class HarnessProcess:
         if not api_key:
             return None
         server_url = get_server_url_from_api_base(provider.api_base)
-        try:
-            catalog = await self.connector_catalog.resolve_catalog(orchestrator)
-        except ConnectorCatalogError:
-            logger.warning("Connector catalog is unavailable during session startup")
-            catalog = None
+        # The cache only: opening a session never waits on the connector
+        # service. With nothing cached, plugin connectors resolve as unavailable,
+        # as an unreachable service does.
+        catalog = await self.connector_catalog.read_cached_catalog(orchestrator)
         entries = (
             tuple(
                 ConnectorCatalogEntry(
@@ -1805,6 +2049,20 @@ def _hook_config_issues(result: HookConfigResult) -> list[ConfigIssue]:
     ]
 
 
+def _custom_tool_issues(failed: Iterable[FailedToolFile]) -> list[ConfigIssue]:
+    return [
+        ConfigIssue(
+            file=str(tool_file.path),
+            message=(
+                f"Custom tool `{tool_file.path.stem}` was not loaded"
+                f" ({tool_file.error}). Custom tools are being deprecated:"
+                " ask Vibe to help you replace it with a skill."
+            ),
+        )
+        for tool_file in failed
+    ]
+
+
 def _user_hook_names(harness_files: HarnessFilesManager) -> set[str]:
     """Names of hooks that come from ``~/.vibe/hooks.toml``, after project-first dedup.
 
@@ -1857,6 +2115,20 @@ def _foreign_hook_definitions(
     ]
 
 
+def _effective_bypass_tool_permissions(
+    config: VibeConfigSchema, requested: bool
+) -> bool:
+    """Resolve the tool-approval bypass from the session flag and the config.
+
+    ``requested`` is the session-wide ``--auto-approve``/``--yolo`` option and
+    ``config.bypass_tool_permissions`` covers the config path (including the
+    auto-approve agent's profile override). A policy setting that disables the
+    auto-approve mode (``enable_auto_approve = false``) clamps both: the flag is
+    a request, not a right.
+    """
+    return (requested or config.bypass_tool_permissions) and config.enable_auto_approve
+
+
 def build_runtime_snapshot(
     options: SessionOptions,
     config_orchestrator: ConfigOrchestrator[VibeConfigSchema],
@@ -1864,11 +2136,8 @@ def build_runtime_snapshot(
     *,
     issues: Sequence[ConfigIssue] = (),
 ) -> RuntimeSnapshot:
-    config = config_orchestrator.config
     agents = AgentManager(
-        config_orchestrator,
-        options.agent or config.resolve_default_agent(),
-        harness_files=harness_files,
+        config_orchestrator, options.agent, harness_files=harness_files
     )
     return build_unified_runtime_snapshot(
         config_orchestrator, agents, issues=issues, auto_approve=options.auto_approve
@@ -1900,6 +2169,18 @@ def build_unified_runtime_snapshot(
     active, available = project_agent_summaries(
         agents.active_profile, agents.available_agents.values()
     )
+    runtime_issues = list(issues)
+    if auto_approve and not config.enable_auto_approve:
+        runtime_issues.append(
+            ConfigIssue(
+                file="--auto-approve",
+                message=(
+                    "Auto-approve was requested (--auto-approve/--yolo) but the mode "
+                    "is disabled (enable_auto_approve = false); approval prompts stay "
+                    "on."
+                ),
+            )
+        )
     return RuntimeSnapshot(
         config=project_config_view(
             config,
@@ -1919,11 +2200,13 @@ def build_unified_runtime_snapshot(
             cached_input_price_per_million=active_model.cached_input_price,
         ),
         context_window=active_model.auto_compact_threshold,
-        issues=list(issues),
+        issues=runtime_issues,
         hooks_count=hooks_count,
         connectors=ConnectorCounts(),
         mcp=MCPState(),
-        bypass_tool_permissions=auto_approve or config.bypass_tool_permissions,
+        bypass_tool_permissions=_effective_bypass_tool_permissions(
+            config, auto_approve
+        ),
     )
 
 
@@ -2037,27 +2320,18 @@ def rust_agent_tool_ceiling(
     # A ceiling, never a grant: the Runtime keeps the stricter of this and the mode
     # the parent holds, so the worst a wrong answer here does is deny a child
     # something it was allowed. ``allowlist``/``denylist`` are not carried as
-    # patterns — they are per-call path and command policy only Vibe's live
-    # resolver can answer, and the child runs under that resolver holding the
-    # parent's configuration rather than a snapshot of the profile's. They still
-    # change the answer: a profile that would hand the child an unconditional
-    # ``allow`` while relying on a list to keep that grant narrow is capped at
-    # ``ask`` instead, so the calls the list was there to restrain reach the user
-    # (see ``agent_ceiling_downgrades``).
-    # For the same reason, ``_rust_tool_modes``' ``never``-plus-allowlist lift has no
-    # counterpart here. There, the resolver reads the very config the mode came from,
-    # so ``ask`` means "deny unless allowlisted"; here it would resolve against the
-    # parent's configuration, and under an auto-approve parent become an unattended
-    # write anywhere in place of the refusal the profile asked for.
+    # patterns: they are per-call path and command policy, which the child's own
+    # resolver answers under the profile's rules (``SubagentPermissions``).
+    # ``_rust_tool_modes``' ``never``-plus-allowlist lift has no counterpart here.
+    # Under an auto-approve parent the child's ``ask`` runs unasked, so the lift
+    # would turn the refusal the profile asked for into an unattended write
+    # anywhere.
     narrowed = _profile_tools(available_tools, overrides)
     per_tool = overrides.get("tools")
     per_tool = per_tool if isinstance(per_tool, Mapping) else {}
 
     def permission(name: str) -> ToolPermission:
-        resolved = _declared_permission(per_tool.get(name), name, permission_of)
-        if resolved is ToolPermission.ALWAYS and _list_narrowed(per_tool.get(name)):
-            return ToolPermission.ASK
-        return resolved
+        return _declared_permission(per_tool.get(name), name, permission_of)
 
     # The ceiling encodes what the profile *permits* (allow/ask/deny), not what
     # the session's approval mode would do. The Runtime takes the stricter of
@@ -2080,38 +2354,6 @@ def rust_agent_tool_ceiling(
             ceiling[builtin] = _RUST_MODE_BY_PERMISSION[strictest]
 
     return ceiling
-
-
-def agent_ceiling_downgrades(
-    available_tools: set[str],
-    permission_of: Callable[[str], ToolPermission],
-    overrides: Mapping[str, Any],
-) -> tuple[str, ...]:
-    """Tools whose profile narrowing ``rust_agent_tool_ceiling`` cannot express.
-
-    A ceiling says allow, ask, or deny per tool. It cannot say "bash, but only
-    these commands", and the resolver that can runs against the parent's
-    configuration rather than the child's profile. A profile that grants a tool
-    outright while relying on a list to keep the grant narrow is therefore capped
-    at ``ask``. Returned so a caller can tell the user which tools that happened
-    to, and that their narrowing is approximated rather than enforced.
-    """
-    per_tool = overrides.get("tools")
-    if not isinstance(per_tool, Mapping):
-        return ()
-    # Measured against the tools the profile actually leaves the child, not
-    # every tool the session has. A profile that disables a tool and still
-    # carries a stanza for it has already denied it, and reporting that a denied
-    # tool will ask for approval describes a call that cannot happen.
-    return tuple(
-        sorted(
-            name
-            for name in _profile_tools(available_tools, overrides)
-            if _list_narrowed(per_tool.get(name))
-            and _declared_permission(per_tool.get(name), name, permission_of)
-            is ToolPermission.ALWAYS
-        )
-    )
 
 
 def _profile_tools(available_tools: set[str], overrides: Mapping[str, Any]) -> set[str]:
@@ -2161,15 +2403,6 @@ def _allowlist_exempts(
     )
 
 
-def _list_narrowed(entry: Any) -> bool:
-    if not isinstance(entry, Mapping):
-        return False
-    return any(
-        isinstance(entry.get(key), list) and entry.get(key)
-        for key in ("allowlist", "denylist")
-    )
-
-
 def _glob_patterns(value: Any) -> list[str]:
     # Overrides come from plugin-authored TOML, so a malformed entry narrows nothing
     # rather than failing the bind.
@@ -2208,23 +2441,24 @@ def _project_session_mcp_server(server: SessionMCPServer) -> MCPServer:
             raise TypeError(f"Unsupported session MCP server: {type(server).__name__}")
 
 
-async def _apply_cached_experiment_variants(
-    config_orchestrator: ConfigOrchestrator[VibeConfigSchema],
+async def _accept_org_config(
+    context: UnifiedSessionContext, applied: OrgConfigAttempt
 ) -> None:
-    """Apply the last cached experiment variants to config before first render."""
-    cached = load_cached_eval_response(config_orchestrator.config)
-    if cached is None:
-        return
-    variants = config_variants_from_response(cached)
-    if not variants:
-        return
-    try:
-        layer = config_orchestrator.get_layer(GrowthbookLayer.NAME)
-    except KeyError:
-        return
-    if isinstance(layer, GrowthbookLayer):
-        layer.set_variants(variants)
-        await config_orchestrator.reload()
+    """Check the org config a context was built under, then cache what the
+    start fetched.
+
+    Built is not enough: the Core must accept the config too, or the failure
+    would only surface when the session starts, past every fallback. Raises
+    when the Core rejects it, and nothing is cached. Caching an unchanged
+    answer again restarts its expiry.
+    """
+    from vibe.app_server._unified_harness_backend_adapter import UnifiedSessionSettings
+
+    orchestrator = context.config_orchestrator
+    if enforced_keys(orchestrator) and context.preflight is not None:
+        await context.preflight(orchestrator.config, UnifiedSessionSettings())
+    if applied.fetched is not None:
+        store_cached_managed_config(context.managed_config_cache_key, applied.fetched)
 
 
 def _session_config_overrides(options: SessionOptions) -> dict[str, object]:

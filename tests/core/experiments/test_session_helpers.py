@@ -12,11 +12,15 @@ from vibe.core.experiments.active import ExperimentSurface
 from vibe.core.experiments.client import RemoteEvalClient
 from vibe.core.experiments.manager import ExperimentManager
 from vibe.core.experiments.models import EvalResponse, ExperimentAttributes
-from vibe.core.experiments.session import initialize_experiments
+from vibe.core.experiments.session import (
+    fetch_and_cache_experiments,
+    initialize_experiments,
+)
+from vibe.core.experiments.wait import experiments_eval_failed
 from vibe.core.identity import IdentityResult
 from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE
 from vibe.core.telemetry.types import LaunchContext, TerminalEmulator
-from vibe.setup.auth.whoami import WhoAmIResult
+from vibe.setup.auth.whoami import WhoAmIResult, store_cached_whoami
 
 
 @pytest.fixture(autouse=True)
@@ -382,6 +386,7 @@ async def test_initialize_returns_false_when_remote_eval_fails(
     # this is the "tried but failed" case, distinct from "NO_PLAN_DATA".
     assert result[1] is None
     persist.assert_not_called()
+    assert experiments_eval_failed() is True
 
 
 @pytest.mark.asyncio
@@ -420,6 +425,36 @@ async def test_initialize_returns_true_and_persists_when_remote_eval_succeeds(
 
     assert result[0] is True
     persist.assert_awaited_once()
+    assert experiments_eval_failed() is False
+
+
+@pytest.mark.asyncio
+async def test_an_eval_without_a_user_id_stops_later_waits(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # No hash attribute: the response assigns nothing and is not cached, so a
+    # later session would wait for another eval that cannot route it either.
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (MagicMock(), "fake-key"),
+    )
+    response = EvalResponse.model_validate({
+        "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
+    })
+    session_logger = MagicMock()
+    session_logger.persist_experiments = AsyncMock()
+
+    result = await initialize_experiments(
+        harness=ExperimentSurface.UNIFIED,
+        config=_make_config(),
+        manager=ExperimentManager(client=_StubClient(response)),
+        session_logger=session_logger,
+        launch_context=None,
+    )
+
+    assert result[0] is True
+    assert experiments_eval_failed() is True
+    assert not EXPERIMENT_EVAL_CACHE_FILE.path.exists()
 
 
 @pytest.mark.asyncio
@@ -848,3 +883,69 @@ async def test_initialize_keeps_the_cache_when_bucketing_never_resolved(
     )
 
     assert stored == []
+
+
+def _launch_context() -> LaunchContext:
+    return LaunchContext(
+        agent_entrypoint="cli",
+        agent_version="0",
+        client_name="vibe-desktop",
+        client_version="0",
+    )
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_cache_takes_the_plan_from_the_whoami_disk_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # As on a session start: the cached /whoami answer, not a live call.
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
+        lambda _config: (MagicMock(), "fake-key"),
+    )
+    monkeypatch.setattr(
+        "vibe.core.identity_cache.fetch_identity", AsyncMock(return_value=None)
+    )
+    live_whoami = AsyncMock(side_effect=AssertionError("live /whoami call"))
+    monkeypatch.setattr("vibe.setup.auth.whoami.HttpAccountGateway.read", live_whoami)
+    store_cached_whoami(
+        "fake-key",
+        WhoAmIResult(
+            plan_type=AccountPlanKind.MISTRAL_CODE,
+            plan_name="cached-plan",
+            prompt_switching_to_pro_plan=False,
+        ),
+    )
+    client = _StubClient(None)
+    monkeypatch.setattr(
+        RemoteEvalClient, "from_settings", classmethod(lambda cls, **_: client)
+    )
+
+    await fetch_and_cache_experiments(
+        _make_config(), _launch_context(), harness=ExperimentSurface.UNIFIED
+    )
+
+    assert client.attributes is not None
+    assert client.attributes.planName == "cached-plan"
+    live_whoami.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_fetch_and_cache_never_raises_and_records_the_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        "vibe.core.experiments.session.initialize_experiments",
+        AsyncMock(side_effect=RuntimeError("eval exploded")),
+    )
+    monkeypatch.setattr(
+        RemoteEvalClient,
+        "from_settings",
+        classmethod(lambda cls, **_: _StubClient(None)),
+    )
+
+    await fetch_and_cache_experiments(
+        _make_config(), _launch_context(), harness=ExperimentSurface.UNIFIED
+    )
+
+    assert experiments_eval_failed() is True

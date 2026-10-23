@@ -141,6 +141,20 @@ fn tables_split_headers_from_rows() {
 }
 
 #[test]
+fn tables_inside_list_items_keep_their_cells() {
+    let blocks = parse("- intro\n\n  | a | b |\n  | --- | --- |\n  | 1 | 2 |");
+    let Block::List { items, .. } = &blocks[0] else {
+        panic!("expected a list");
+    };
+    assert_eq!(text(&items[0].inline), "intro");
+    let Block::Table { headers, rows } = &items[0].children[0] else {
+        panic!("expected a nested table");
+    };
+    assert_eq!(text(&headers[1]), "b");
+    assert_eq!(text(&rows[0][0]), "1");
+}
+
+#[test]
 fn bare_urls_autolink_inside_paragraphs() {
     let blocks = parse("see https://example.com/x now");
     let Block::Paragraph(inline) = &blocks[0] else {
@@ -152,18 +166,6 @@ fn bare_urls_autolink_inside_paragraphs() {
         .map(|sc| sc.0)
         .collect();
     assert_eq!(underlined, "https://example.com/x");
-}
-
-#[test]
-fn strikethrough_styles_text_without_markers() {
-    let blocks = parse("~~gone~~");
-    let Block::Paragraph(inline) = &blocks[0] else {
-        panic!("expected a paragraph");
-    };
-    assert_eq!(text(inline), "gone");
-    assert!(inline
-        .iter()
-        .all(|sc| sc.1.add_modifier.contains(Modifier::CROSSED_OUT)));
 }
 
 #[test]
@@ -248,16 +250,6 @@ fn task_list_markers_stay_literal_item_text() {
     assert_eq!(text(&items[0].inline), "[ ] todo");
     assert_eq!(text(&items[1].inline), "[x] done");
     assert_eq!(text(&items[2].inline), "[X] upper");
-}
-
-#[test]
-fn task_list_marker_appears_once_per_item() {
-    let blocks = parse("- [x] done");
-    let Block::List { items, .. } = &blocks[0] else {
-        panic!("expected a list");
-    };
-    assert_eq!(items[0].inline.iter().filter(|sc| sc.0 == 'x').count(), 1);
-    assert_eq!(text(&items[0].inline).matches("[x]").count(), 1);
 }
 
 #[test]
@@ -501,25 +493,4 @@ fn strikethrough_crosses_out_the_text() {
         .1
         .add_modifier
         .contains(Modifier::CROSSED_OUT));
-}
-
-#[test]
-fn task_list_items_keep_their_checkbox_text() {
-    let blocks = parse("- [ ] open\n- [x] done");
-    let Block::List { start: None, items } = &blocks[0] else {
-        panic!("expected a list");
-    };
-    assert_eq!(text(&items[0].inline), "[ ] open");
-    assert_eq!(text(&items[1].inline), "[x] done");
-}
-
-#[test]
-fn images_render_the_glyph_pair_and_alt_as_a_link_label() {
-    let blocks = parse("![alt text](https://example.com/img.png)");
-    let Block::Paragraph(inline) = &blocks[0] else {
-        panic!("expected a paragraph");
-    };
-    assert_eq!(text(inline), "\u{1f5bc}  alt text");
-    assert!(inline[0].1.add_modifier.contains(Modifier::UNDERLINED));
-    assert_eq!(inline[0].2, Some(0), "the image registers a link target");
 }

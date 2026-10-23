@@ -1,9 +1,9 @@
 """Per-key JSON cache files with a TTL, written atomically.
 
-Shared by the experiment-eval cache and the model-catalog cache: one file
-per feature, entries keyed by a per-user key (the hashed Mistral API key),
-each entry stamped with ``stored_at_timestamp`` and a payload. A stale or
-corrupt entry is never fatal — the caller gets None and falls back.
+Shared by the experiment-eval, model-catalog, and managed-config caches:
+one file per feature, entries keyed by a per-user key (the hashed Mistral
+API key), each entry stamped with ``stored_at_timestamp`` and a payload. A
+stale or corrupt entry is never fatal — the caller gets None and falls back.
 """
 
 from __future__ import annotations
@@ -49,7 +49,7 @@ def _read_entries(path: Path) -> dict[str, Any]:
     try:
         with path.open(encoding="utf-8") as f:
             data = json.load(f)
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return {}
     return data if isinstance(data, dict) else {}
 
@@ -61,7 +61,7 @@ def _write_entries(path: Path, entries: dict[str, Any]) -> None:
         with tmp_path.open("w", encoding="utf-8") as f:
             json.dump(entries, f, separators=(",", ":"))
         os.replace(tmp_path, path)
-    except OSError, TypeError:
+    except (OSError, TypeError):
         try:
             tmp_path.unlink(missing_ok=True)
         except OSError:

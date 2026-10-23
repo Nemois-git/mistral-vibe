@@ -8,6 +8,7 @@ mod action_id;
 mod capabilities;
 mod checkpoint;
 pub(crate) mod config;
+mod conversation;
 mod error;
 mod features;
 mod helpers;
@@ -32,6 +33,7 @@ pub(crate) use checkpoint::Checkpoint;
 #[allow(unused_imports)]
 pub(crate) use checkpoint::decode_checkpoint;
 pub(crate) use config::HarnessConfig;
+pub(crate) use conversation::ConversationSeed;
 #[cfg(test)]
 pub(crate) use features::large_output::Policy as LargeOutputPolicy;
 pub(crate) use session::HarnessSession;
@@ -53,18 +55,19 @@ pub(crate) use testing::{
     CommandState, CompactionBudget, CompactionPolicy, CompactionTrigger, CompletionActionKind,
     CompletionCandidate, CompletionFinishReason, CompletionHookOutput, CompletionPurpose,
     CompletionResult, CompletionResultPart, CompletionResultSemanticPart, ContextSettings,
-    ExternalTool, ExternalToolCall, HarnessConfigurationChange, HarnessSettings, HookBinding,
-    HookCall, HookPoint, HookResult, HookSelector, HookToolCall, HookToolKey, HookToolTarget,
-    ImageDeliveryMode, ImageDeliverySettings, ImageTokenCost, ModelInputUpdate, ModelMessageUpdate,
-    ModelToolCatalogUpdate, Notification, NotificationLevel, NotificationSource,
-    PendingActionInspection, PendingCompletionPurpose, PendingLifecycleHook, PreAgentTurnOutput,
-    PreToolCallOutput, ProcessTerminalStatus, ProgramExecution, ProgrammaticToolSettings,
-    ProtocolError, ProvidedToolCall, ProvidedToolDefinition, ProvidedToolExposure, QueuedTurn,
-    ReasoningContent, RuntimeBuiltinToolCall, RuntimeBuiltinToolName, SessionStatus,
-    SkillDefinition, StateInspection, StoredMessageSource, StructuredContent, SubagentMode,
-    TokenUsage, ToolArguments, ToolBatch, ToolCall, ToolContext, ToolDefinition, ToolExecution,
-    ToolExecutionState, ToolGroupDefinition, ToolGroupMetadata, ToolOrigin, ToolOutcome,
-    ToolResult, ToolSettings, ToolTarget, Turn, TurnOutcome, TurnSettings, UserMessageMode,
+    ExternalCallStage, ExternalTool, ExternalToolCall, HarnessConfigurationChange, HarnessSettings,
+    HookBinding, HookCall, HookPoint, HookResult, HookSelector, HookToolCall, HookToolKey,
+    HookToolTarget, ImageDeliveryMode, ImageDeliverySettings, ImageTokenCost, InputModality,
+    ModelInputUpdate, ModelMessageUpdate, ModelToolCatalogUpdate, Notification, NotificationLevel,
+    NotificationSource, PendingActionInspection, PendingCompletionPurpose, PendingLifecycleHook,
+    PreAgentTurnOutput, PreToolCallOutput, ProcessTerminalStatus, ProgramExecution,
+    ProgrammaticToolSettings, ProtocolError, ProvidedToolCall, ProvidedToolDefinition,
+    ProvidedToolExposure, QueuedTurn, ReasoningContent, RuntimeBuiltinToolCall,
+    RuntimeBuiltinToolName, SessionStatus, SkillDefinition, StateInspection, StoredMessageSource,
+    StructuredContent, SubagentMode, TokenUsage, ToolArguments, ToolBatch, ToolCall, ToolContext,
+    ToolDefinition, ToolExecution, ToolExecutionState, ToolGroupDefinition, ToolGroupMetadata,
+    ToolOrigin, ToolOutcome, ToolResult, ToolSettings, ToolTarget, Turn, TurnOutcome, TurnSettings,
+    UserMessageMode,
 };
 
 use crate::core::config::HarnessConfigUpdate;
@@ -86,6 +89,18 @@ use crate::core::wire::message::StoredMessage;
 
 pub(crate) fn hook_tool_catalog(config: &HarnessConfig) -> Vec<hooks::HookToolKey> {
     tools::resolved::hook_tool_catalog(config)
+}
+
+/// Checks one permission rule pattern with the same glob syntax that policy
+/// evaluation uses, so a Runtime can reject it before it creates a Session.
+/// An argument pattern must also use one separator spelling.
+pub(crate) fn validate_permission_pattern(pattern: &str, arguments: bool) -> Result<(), String> {
+    let field = if arguments {
+        features::permissions::PermissionPatternField::Arguments
+    } else {
+        features::permissions::PermissionPatternField::Tools
+    };
+    features::permissions::validate_permission_pattern(pattern, field)
 }
 
 pub(crate) fn initial_state(config: HarnessConfig) -> Result<HarnessState, CoreError> {
@@ -160,8 +175,9 @@ pub(crate) fn reconfigure_in_place(
     // compiled model tool list as well as the prompt and capability sources.
     let tool_catalog_changed = tool_catalog_source_changed(&state.config, &next_config)
         || state.resolved_tools.top_level_tools() != next_resolved_tools.top_level_tools();
-    let agent_image_delivery_changed = state.config.settings.context.image_delivery.agent
-        != next_config.settings.context.image_delivery.agent;
+    let current_image_delivery = state.config.settings.context.effective_image_delivery();
+    let next_image_delivery = next_config.settings.context.effective_image_delivery();
+    let agent_image_delivery_changed = current_image_delivery.agent != next_image_delivery.agent;
     state.config = next_config;
     state
         .notifications
@@ -172,6 +188,10 @@ pub(crate) fn reconfigure_in_place(
         state.mark_tool_catalog_changed();
     }
     if rebuild_system_prompt && !state.context.is_empty() {
+        // Rewriting the system prompt in place invalidates the provider KV cache for
+        // the whole history. A skill catalog change takes this path because the
+        // catalog lives in the system prompt. It stops once catalog changes are
+        // delivered as appended context with a KV-cache-friendly context upsert.
         let system_prompt = build_system_prompt(
             &state.config,
             state.resolved_tools.tool_group_inventory_prompt_section(),
@@ -218,6 +238,10 @@ fn patched_system_prompt(
 
 fn tool_catalog_source_changed(current: &HarnessConfig, next: &HarnessConfig) -> bool {
     current.settings.tools.command_environment != next.settings.tools.command_environment
+        || current
+            .settings
+            .prompts
+            .tool_text_changed(&next.settings.prompts)
         || current.capabilities.tool_groups != next.capabilities.tool_groups
         || current.capabilities.skills != next.capabilities.skills
         || current.plugins.len() != next.plugins.len()
@@ -241,11 +265,18 @@ fn planned_config(
 ) -> Result<(HarnessConfig, ResolvedTools), CoreError> {
     let mut next = current.clone();
     if let Some(settings) = update.settings {
+        if current.settings.tools.permissions != settings.tools.permissions {
+            return Err(CoreError::invalid_configuration(
+                "settings.tools.permissions",
+                "settings.tools.permissions cannot be reconfigured after session creation",
+            ));
+        }
         subagents::validate_reconfiguration(
             &current.settings.tools.subagents,
             &settings.tools.subagents,
         )
         .map_err(|detail| CoreError::invalid_configuration("settings.tools.subagents", detail))?;
+        validate_builtin_reconfiguration(&current.settings.tools, &settings.tools)?;
         next.settings = settings;
     }
     if let Some(capabilities) = update.capabilities {
@@ -270,6 +301,38 @@ fn planned_config(
     capabilities::validate(&next)
         .map_err(|detail| CoreError::invalid_configuration("capabilities", detail))?;
     Ok((next, resolved_tools))
+}
+
+/// Built-in feature switches shape the model tool catalog and system prompt, so
+/// they stay fixed for the Session lifetime.
+fn validate_builtin_reconfiguration(
+    current: &config::ToolSettings,
+    next: &config::ToolSettings,
+) -> Result<(), CoreError> {
+    let unchanged = [
+        (
+            "settings.tools.file_system",
+            current.file_system == next.file_system,
+        ),
+        ("settings.tools.skills", current.skills == next.skills),
+        (
+            "settings.tools.programmatic.mode",
+            current.programmatic.mode == next.programmatic.mode,
+        ),
+        (
+            "settings.tools.programmatic.sleep",
+            current.programmatic.sleep == next.programmatic.sleep,
+        ),
+    ];
+    for (field, unchanged) in unchanged {
+        if !unchanged {
+            return Err(CoreError::invalid_configuration(
+                field,
+                format!("{field} cannot be reconfigured after session creation"),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn validate_compaction_budget(

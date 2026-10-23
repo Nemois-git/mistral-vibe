@@ -12,14 +12,18 @@ from vibe.core.experiments.cache import (
     clear_cached_eval_responses,
     store_cached_eval_response,
 )
+from vibe.core.experiments.client import RemoteEvalClient
 from vibe.core.experiments.manager import ExperimentManager
 from vibe.core.experiments.models import EvalResponse, ExperimentAttributes
+from vibe.core.experiments.wait import mark_experiments_eval_failed
 from vibe.core.identity import IdentityResult, fetch_identity
+from vibe.core.identity_cache import IdentityCache
 from vibe.core.telemetry.send import get_mistral_provider_and_api_key
 from vibe.core.utils import get_platform_id
 from vibe.observability.logging import logger
 from vibe.setup.auth.whoami import (
     NO_PLAN_DATA,
+    WhoAmICache,
     WhoAmIResult,
     derive_user_plan,
     fetch_whoami,
@@ -40,6 +44,15 @@ WhoAmIResolver = Callable[..., Awaitable[WhoAmIResult | None]]
 # session metadata has no experiments field — passes a no-op.
 class ExperimentStateSink(Protocol):
     async def persist_experiments(self, response: EvalResponse | None) -> None: ...
+
+
+class NullExperimentSink:
+    """For a caller with nowhere to persist the assignment: the global eval
+    cache is then its only continuity.
+    """
+
+    async def persist_experiments(self, response: EvalResponse | None) -> None:
+        del response
 
 
 async def _fetch_plan_attributes(
@@ -149,10 +162,14 @@ async def initialize_experiments(
         # Remote eval failed (network / 4xx-5xx / invalid payload). The manager
         # is fail-open and stayed empty, so nothing changed — don't trigger a
         # prompt refresh. We still surface user_plan for early telemetry events.
+        mark_experiments_eval_failed()
         return False, user_plan
-    if attributes.userId is not None:
-        # Without the hash attribute the response carries no assignment, and
-        # caching that empty result would overwrite a good entry.
+    if attributes.userId is None:
+        # Without the hash attribute the response carries no assignment:
+        # caching it would overwrite a good entry, and a later session gains
+        # nothing by waiting for another one.
+        mark_experiments_eval_failed()
+    else:
         try:
             store_cached_eval_response(config, state)
         except Exception:
@@ -165,6 +182,41 @@ async def initialize_experiments(
     except Exception:
         logger.exception("Failed to persist experiments")
     return True, user_plan
+
+
+async def fetch_and_cache_experiments(
+    config: VibeConfigSchema,
+    launch_context: LaunchContext,
+    *,
+    harness: ExperimentSurface,
+) -> None:
+    """Evaluate the experiments once and cache the result, for a caller with
+    no session. Fail-open: never raises, and records a failure for the process
+    (``vibe.core.experiments.wait``).
+    """
+    manager = ExperimentManager(
+        client=RemoteEvalClient.from_settings(
+            api_host=config.experiments.api_host,
+            client_key=config.experiments.client_key,
+        )
+    )
+    try:
+        # Through the caches a session start resolves them with: /whoami's
+        # disk cache keeps the plan a failed live call would drop.
+        await initialize_experiments(
+            config=config,
+            manager=manager,
+            session_logger=NullExperimentSink(),
+            launch_context=launch_context,
+            harness=harness,
+            resolve_identity=IdentityCache().resolve,
+            resolve_whoami=WhoAmICache().resolve,
+        )
+    except Exception:
+        mark_experiments_eval_failed()
+        logger.exception("Experiments fetch failed unexpectedly")
+    finally:
+        await manager.aclose()
 
 
 def _build_attributes(

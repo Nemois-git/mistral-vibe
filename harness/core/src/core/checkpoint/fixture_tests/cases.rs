@@ -2,17 +2,17 @@ use serde_json::{Value, json};
 
 use super::{CONFIG_SECRET, FixtureCase};
 use crate::core::features::compaction::{
-    CompactionBudget, CompactionProjection, CompactionProjectionFit, CompactionTrigger,
-    PendingCompaction,
+    CompactionBudget, CompactionFallback, CompactionProjection, CompactionProjectionFit,
+    CompactionTrigger, NewestToolExchange, PendingCompaction,
 };
 use crate::core::features::notifications::NotificationState;
 use crate::core::features::programmatic_tool_calling::{
-    PendingProgramRecord, ProgramExecution, ProgramFunctionRecord, ProgramOperationRecord,
+    PendingProgramOperation, ProgramExecution, ProgramFunctionRecord, ProgramOperationRecord,
 };
 use crate::core::features::skills;
 use crate::core::hooks::hook_action_id;
+use crate::core::tools::execution::external_call::{ExternalCallStage, PendingExternalCall};
 use crate::core::tools::external::RuntimeBuiltinToolName;
-use crate::core::turn::SuspendedTurn;
 use crate::core::{
     ActivePhase, ActiveTurn, AssistantPart, AssistantRole, AssistantSemanticPart, CandidateMessage,
     CompletionCandidate, CompletionFinishReason, CompletionPurpose, ContentBlock, ExternalTool,
@@ -122,9 +122,10 @@ fn historical_state() -> HarnessState {
     .unwrap();
     state
         .context
-        .push(StoredMessage::injected(Message::user_text(
+        .push_before_next_turn(StoredMessage::injected(Message::user_text(
             "runtime-injected context",
-        )));
+        )))
+        .unwrap();
     state.compaction_count = 2;
     state
 }
@@ -164,19 +165,22 @@ fn awaiting_completion_state(purpose: CompletionPurpose) -> HarnessState {
     let compaction_projection = if purpose == CompletionPurpose::Compaction {
         state
             .context
-            .push(StoredMessage::visible(Message::assistant(vec![
+            .push_in_current_turn(StoredMessage::visible(Message::assistant(vec![
                 AssistantPart::Content(text_block("completed projected round")),
             ])));
         state
             .context
-            .push(StoredMessage::visible(Message::user_text(
+            .push_in_current_turn(StoredMessage::visible(Message::user_text(
                 "current raw request",
             )));
         Some(
-            fixture_projection(&state, "")
-                .retry_after_invalid_summary()
-                .expect("fixture summary retry is valid")
-                .expect("fixture projection has one summary retry"),
+            fixture_projection(&state, "", NewestToolExchange::Keep)
+                .fall_back(
+                    CompactionFallback::Standalone,
+                    state.config.settings.context.compaction.token_threshold(),
+                )
+                .expect("fixture standalone fallback is valid")
+                .expect("fixture in-context projection has a standalone fallback"),
         )
     } else {
         None
@@ -200,6 +204,7 @@ fn awaiting_completion_state(purpose: CompletionPurpose) -> HarnessState {
         phase,
         pending_steer: Vec::new(),
         model_input_ready: false,
+        output_limit_retries: 0,
         queued: QueuedTurn::Empty,
     });
     state
@@ -207,7 +212,11 @@ fn awaiting_completion_state(purpose: CompletionPurpose) -> HarnessState {
 
 fn between_turn_manual_compaction_state() -> HarnessState {
     let mut state = historical_state();
-    let projection = fixture_projection(&state, "preserve fixture details");
+    let projection = fixture_projection(
+        &state,
+        "preserve fixture details",
+        NewestToolExchange::MayRemove,
+    );
     state.turn = TurnState::Compacting {
         pending: PendingCompaction::between_turns(
             crate::core::action_id::compaction("checkpoint-fixture-task", 3),
@@ -230,11 +239,11 @@ fn pre_agent_hook_state() -> HarnessState {
                 hook_binding_ids: vec!["hook-pre-agent".to_string()],
                 turn_id,
                 user_content: vec![text_block("start work")],
-                suspended: SuspendedTurn::Idle,
             },
         },
         pending_steer: Vec::new(),
         model_input_ready: false,
+        output_limit_retries: 0,
         queued: QueuedTurn::Empty,
     });
     state
@@ -271,6 +280,7 @@ fn completion_hook_state(point: HookPoint) -> HarnessState {
         phase: ActivePhase::AwaitingHook { pending },
         pending_steer: Vec::new(),
         model_input_ready: false,
+        output_limit_retries: 0,
         queued: QueuedTurn::Empty,
     });
     state
@@ -305,7 +315,7 @@ fn tool_batch_state() -> HarnessState {
     ];
     state
         .context
-        .push(StoredMessage::visible(tool_batch_assistant_message(
+        .push_in_current_turn(StoredMessage::visible(tool_batch_assistant_message(
             &executions,
         )));
     state.turn = TurnState::Active(ActiveTurn {
@@ -318,6 +328,7 @@ fn tool_batch_state() -> HarnessState {
             "steer after the current batch",
         ))],
         model_input_ready: false,
+        output_limit_retries: 0,
         queued: QueuedTurn::Pending {
             turn_id: "turn-queued".to_string(),
             messages: vec![StoredMessage::visible(Message::user_text(
@@ -343,7 +354,7 @@ fn skill_read_state() -> HarnessState {
     let execution = direct_skill_pending_execution();
     state
         .context
-        .push(StoredMessage::visible(tool_batch_assistant_message(
+        .push_in_current_turn(StoredMessage::visible(tool_batch_assistant_message(
             std::slice::from_ref(&execution),
         )));
     state.turn = TurnState::Active(ActiveTurn {
@@ -356,12 +367,17 @@ fn skill_read_state() -> HarnessState {
         },
         pending_steer: Vec::new(),
         model_input_ready: false,
+        output_limit_retries: 0,
         queued: QueuedTurn::Empty,
     });
     state
 }
 
-fn fixture_projection(state: &HarnessState, extra_instructions: &str) -> CompactionProjection {
+fn fixture_projection(
+    state: &HarnessState,
+    extra_instructions: &str,
+    newest_tool_exchange: NewestToolExchange,
+) -> CompactionProjection {
     let projection = CompactionProjection::initial(
         state.context.messages(),
         state.generated_system_message(),
@@ -372,6 +388,7 @@ fn fixture_projection(state: &HarnessState, extra_instructions: &str) -> Compact
             image_delivery: state.config.settings.context.image_delivery.compaction,
             image_cost: state.config.settings.context.image_token_cost,
         },
+        newest_tool_exchange,
     )
     .expect("fixture compaction projection can be estimated");
     let CompactionProjectionFit::Fitted(projection) = projection else {
@@ -404,11 +421,10 @@ fn direct_pre_hook_execution() -> ToolExecution {
     let call = external_read_call(call_id, ToolOrigin::TopLevel, "pre.txt");
     ToolExecution {
         call: model_tool_call(call_id, "read_file", json!({ "path": "pre.txt" })),
-        state: ToolExecutionState::DirectAwaitingPreHook {
-            hook_action_id: hook_action_id(&call.action_id, HookPoint::PreToolCall),
-            hook_binding_ids: vec!["hook-direct-pre".to_string()],
+        state: ToolExecutionState::Direct(PendingExternalCall::awaiting_pre_hook(
             call,
-        },
+            vec!["hook-direct-pre".to_string()],
+        )),
     }
 }
 
@@ -416,9 +432,11 @@ fn direct_pending_execution() -> ToolExecution {
     let call_id = "direct-pending";
     ToolExecution {
         call: model_tool_call(call_id, "read_file", json!({ "path": "pending.txt" })),
-        state: ToolExecutionState::DirectPending {
-            call: external_read_call(call_id, ToolOrigin::TopLevel, "pending.txt"),
-        },
+        state: ToolExecutionState::Direct(PendingExternalCall::pending(external_read_call(
+            call_id,
+            ToolOrigin::TopLevel,
+            "pending.txt",
+        ))),
     }
 }
 
@@ -427,21 +445,19 @@ fn direct_skill_pending_execution() -> ToolExecution {
     let arguments = json!({ "name": "zeta-review" });
     ToolExecution {
         call: model_tool_call(call_id, "skill", arguments.clone()),
-        state: ToolExecutionState::DirectPending {
-            call: ExternalToolCall {
-                action_id: crate::core::tools::external::effect_id_for_operation(
-                    ToolOrigin::TopLevel,
-                    call_id,
-                ),
-                call_id: call_id.to_string(),
-                origin: ToolOrigin::TopLevel,
-                call: ExternalTool::RuntimeBuiltin {
-                    name: skills::ToolName::Read.runtime_tool(),
-                    invocation_name: "skill".to_string(),
-                    arguments,
-                },
+        state: ToolExecutionState::Direct(PendingExternalCall::pending(ExternalToolCall {
+            action_id: crate::core::tools::external::effect_id_for_operation(
+                ToolOrigin::TopLevel,
+                call_id,
+            ),
+            call_id: call_id.to_string(),
+            origin: ToolOrigin::TopLevel,
+            call: ExternalTool::RuntimeBuiltin {
+                name: skills::ToolName::Read.runtime_tool(),
+                invocation_name: "skill".to_string(),
+                arguments,
             },
-        },
+        })),
     }
 }
 
@@ -450,12 +466,14 @@ fn direct_post_hook_execution() -> ToolExecution {
     let call = external_read_call(call_id, ToolOrigin::TopLevel, "post.txt");
     ToolExecution {
         call: model_tool_call(call_id, "read_file", json!({ "path": "post.txt" })),
-        state: ToolExecutionState::DirectAwaitingPostHook {
-            hook_action_id: hook_action_id(&call.action_id, HookPoint::PostToolCall),
-            hook_binding_ids: vec!["hook-direct-post".to_string()],
+        state: ToolExecutionState::Direct(PendingExternalCall {
+            stage: ExternalCallStage::AwaitingPostHook {
+                hook_action_id: hook_action_id(&call.action_id, HookPoint::PostToolCall),
+                hook_binding_ids: vec!["hook-direct-post".to_string()],
+                result: successful_tool_result("raw direct result"),
+            },
             call,
-            result: successful_tool_result("raw direct result"),
-        },
+        }),
     }
 }
 
@@ -529,25 +547,38 @@ fn program_execution(message_count: usize) -> ToolExecution {
         ProgramOperationRecord::ExternalPending {
             id: pre_call.call_id.clone(),
             function: program_function("read_file", json!({ "path": "pre.txt" })),
-            pending: Box::new(PendingProgramRecord::AwaitingPreHook {
-                hook_action_id: hook_action_id(&pre_call.action_id, HookPoint::PreToolCall),
-                hook_binding_ids: vec!["hook-program-pre".to_string()],
-                call: pre_call,
+            pending: Box::new(PendingProgramOperation {
+                external: PendingExternalCall::awaiting_pre_hook(
+                    pre_call,
+                    vec!["hook-program-pre".to_string()],
+                ),
+                requested_sleep_seconds: None,
             }),
         },
         ProgramOperationRecord::ExternalPending {
             id: pending_call.call_id.clone(),
             function: program_function("read_file", json!({ "path": "pending.txt" })),
-            pending: Box::new(PendingProgramRecord::Pending { call: pending_call }),
+            pending: Box::new(PendingProgramOperation {
+                external: PendingExternalCall::pending(pending_call),
+                requested_sleep_seconds: None,
+            }),
         },
         ProgramOperationRecord::ExternalPending {
             id: post_call.call_id.clone(),
             function: program_function("read_file", json!({ "path": "original-post.txt" })),
-            pending: Box::new(PendingProgramRecord::AwaitingPostHook {
-                hook_action_id: hook_action_id(&post_call.action_id, HookPoint::PostToolCall),
-                hook_binding_ids: vec!["hook-program-post".to_string()],
-                result: successful_tool_result("raw program result"),
-                call: post_call,
+            pending: Box::new(PendingProgramOperation {
+                external: PendingExternalCall {
+                    stage: ExternalCallStage::AwaitingPostHook {
+                        hook_action_id: hook_action_id(
+                            &post_call.action_id,
+                            HookPoint::PostToolCall,
+                        ),
+                        hook_binding_ids: vec!["hook-program-post".to_string()],
+                        result: successful_tool_result("raw program result"),
+                    },
+                    call: post_call,
+                },
+                requested_sleep_seconds: None,
             }),
         },
         ProgramOperationRecord::ExternalResolved {
@@ -574,7 +605,7 @@ fn program_execution(message_count: usize) -> ToolExecution {
                 fixture_program_code().to_string(),
                 operations,
                 0,
-                None,
+                Default::default(),
             )
             .unwrap(),
         },

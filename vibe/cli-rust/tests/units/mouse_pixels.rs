@@ -3,7 +3,8 @@
 use crossterm::event::{Event, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
 use vibe_rs::mouse::pixels::{
-    cell_size, cells, is_answered, supports, transition, validated, Coalesce, Grid,
+    cell_size, cells, is_answered, reported_grid, settle, supports, transition, validated,
+    Coalesce, Grid, ENABLE,
 };
 
 const GRID: Grid = Grid {
@@ -79,17 +80,6 @@ fn the_cell_size_reply_reads_as_width_and_height() {
 }
 
 #[test]
-fn whole_pixel_cells_ignore_the_leftover_pixels() {
-    let grid = Grid {
-        width: 1009,
-        height: 819,
-        ..GRID
-    };
-
-    assert_eq!(grid.cell(), (10, 20));
-}
-
-#[test]
 fn pixel_reports_need_window_cells_matching_the_probed_cell_size() {
     let leftover = Grid {
         width: 1009,
@@ -115,6 +105,28 @@ fn leaving_pixel_reports_mid_session_restores_sgr_reports() {
     assert_eq!(transition(false, true), Some("\x1b[?1016h"));
     assert_eq!(transition(true, true), None);
     assert_eq!(transition(false, false), None);
+}
+
+#[test]
+fn capture_turned_on_after_a_cached_off_start_enables_pixel_reports() {
+    let valid = validated(Some((10, 20)), Some(GRID));
+    let off = reported_grid(valid, false, false);
+    assert_eq!(
+        off, None,
+        "no pixel reports while the mouse is not captured"
+    );
+    assert_eq!(transition(false, off.is_some()), None);
+
+    let on = reported_grid(valid, false, true);
+    assert_eq!(on, Some(GRID));
+    assert_eq!(transition(off.is_some(), on.is_some()), Some(ENABLE));
+    assert_eq!(
+        reported_grid(valid, true, true),
+        None,
+        "a gesture holds cells"
+    );
+    let unprobed = validated(None, Some(GRID));
+    assert_eq!(reported_grid(unprobed, false, true), None, "unprobed");
 }
 
 #[test]
@@ -168,6 +180,34 @@ fn presses_and_other_events_are_never_dropped() {
     assert!(coalesce.keep(None, &press));
     assert!(coalesce.keep(None, &Event::FocusGained));
     assert!(coalesce.keep(None, &Event::FocusGained));
+}
+
+#[test]
+fn a_report_around_a_switch_to_cells_reads_in_the_units_nearer_the_pointer() {
+    let drag = MouseEventKind::Drag(MouseButton::Left);
+    let read = |event| {
+        let ((cell, _), pixel) = settle(GRID, (50, 20), event, false);
+        ((cell.column, cell.row), pixel)
+    };
+
+    assert_eq!(read(pixels(drag, 515, 430)), ((51, 21), true));
+    assert_eq!(read(event(drag, 49, 19)), ((49, 19), false));
+    assert_eq!(read(event(drag, 49, 0)), ((49, 0), false));
+}
+
+#[test]
+fn a_tie_around_a_switch_reads_in_the_new_units() {
+    let tie = event(MouseEventKind::Moved, 0, 0);
+
+    assert!(settle(GRID, (0, 0), tie, true).1);
+    assert!(!settle(GRID, (0, 0), tie, false).1);
+}
+
+#[test]
+fn an_edge_pixel_report_around_a_switch_stays_a_pixel_report() {
+    let ((cell, _), pixel) = settle(GRID, (0, 1), pixels(MouseEventKind::Moved, 0, 25), false);
+
+    assert_eq!(((cell.column, cell.row), pixel), ((0, 1), true));
 }
 
 /// A 0-based SGR-pixels report as crossterm parses it: minus one, wrapping at 0.

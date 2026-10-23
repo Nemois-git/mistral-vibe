@@ -13,6 +13,11 @@ from vibe.config_values import (
     TranscriptionEncoding,
 )
 
+# Where a model comes from, as the pickers group it: `project` covers project
+# config, agent profile, env and session overrides; `local` the user config and
+# built-ins.
+ModelSource = Literal["admin", "growthbook", "catalog", "project", "local"]
+
 
 class ModelConfigView(ProtocolModel):
     name: str
@@ -32,6 +37,10 @@ class ModelConfigView(ProtocolModel):
     # Expected delivery of file-backed images; None means the runtime has not
     # advertised a delivery mode. Native model support alone is not a fallback policy.
     image_delivery: Literal["native", "resource_link"] | None = None
+    # The group the model is listed under, from the highest-priority layer that
+    # defines it; None from an older server (ADR 0014) or when no known layer
+    # defines it.
+    source: ModelSource | None = None
 
 
 class TranscribeModelConfigView(ProtocolModel):
@@ -88,6 +97,8 @@ class ConfigView(ProtocolModel):
     cursor_blink: bool = True
     show_greeting: bool
     autocopy_to_clipboard: bool
+    # Preserve mouse capture when reading an older app-server response (ADR 0014).
+    enable_mouse_capture: bool = True
     file_watcher_for_autocomplete: bool
     ask_confirmation_on_exit: bool
     voice_mode_enabled: bool

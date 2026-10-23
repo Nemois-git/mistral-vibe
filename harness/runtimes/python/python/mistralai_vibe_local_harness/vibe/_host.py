@@ -16,7 +16,7 @@ from pathlib import Path
 import threading
 import time
 from typing import Any, Literal, cast
-from weakref import WeakKeyDictionary
+from weakref import WeakKeyDictionary, WeakValueDictionary
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -187,7 +187,10 @@ from mistralai_vibe_local_harness.vibe._subagents._configuration import (
     resolve_declared_agent_types,
     resolve_subagent_configuration,
 )
-from mistralai_vibe_local_harness.vibe._subagents._controller import SubagentController
+from mistralai_vibe_local_harness.vibe._subagents._controller import (
+    ChildInterruptResult,
+    SubagentController,
+)
 from mistralai_vibe_local_harness.vibe._subagents._host import (
     ChildCommandAdmission,
     ChildSessionHandle,
@@ -385,7 +388,9 @@ def _extend_subagent_bindings(
         or not plugins.agent_profiles
     ):
         return configured
-    return resolve_declared_agent_types(configured, adapter, plugins.agent_profiles)
+    return resolve_declared_agent_types(
+        configured, adapter, plugins.agent_profiles, plugins.agent_permission_resolvers
+    )
 
 
 def _fork_live_session_config(
@@ -434,6 +439,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         self._plugin_provider: SessionPluginProvider | None = None
         self._requested_plugins: tuple[ResolvedPluginDefinition, ...] = ()
         self._mcp_catalog: ResolvedMCPCatalog | None = None
+        self._mcp_open_from_cache = False
         self._mcp_authorization_provider: MCPAuthorizationProvider | None = None
         self._mcp_cache_root = self._storage_root / "mcp-descriptors"
         self._mcp_cache_policy = MCPDescriptorCachePolicy()
@@ -460,6 +466,12 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             SubagentController,
             tuple[ResolvedSubagentConfiguration, LocalRuntimeAdapterConfig],
         ] = WeakKeyDictionary()
+        # Roots whose subagent controller is open but which are not registered yet.
+        # Restoring a root reopens its unsettled children before the root itself is
+        # registered, and each child takes its hooks from that root.
+        self._opening_parents: WeakValueDictionary[
+            str, UnifiedHarnessSessionBackend
+        ] = WeakValueDictionary()
         self._child_lock = asyncio.Lock()
         self._tree_deletion_leases: dict[str, _TreeDeletionLeases] = {}
         self._loop: asyncio.AbstractEventLoop | None = None
@@ -573,8 +585,16 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         http_transport_policy: MCPHTTPTransportPolicy | None = None,
         sampling_completion: MCPSamplingCompletion | None = None,
         transport_factory: MCPTransportFactory | None = None,
+        open_from_cache: bool = False,
     ) -> None:
+        """Install the MCP catalog every session opened from now on resolves.
+
+        With ``open_from_cache`` a root session opens on cached descriptors
+        only, and the caller discovers the rest through
+        ``discover_pending_mcp``, so a slow server never holds up opening one.
+        """
         self._mcp_catalog = catalog
+        self._mcp_open_from_cache = open_from_cache
         self._mcp_authorization_provider = authorization_provider
         if cache_root is not None:
             self._mcp_cache_root = Path(cache_root).expanduser().resolve()
@@ -1685,6 +1705,38 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             record.model_copy(deep=True) for record in subagents.children.values()
         )
 
+    async def wait_for_children_settled(self, root_session_id: str) -> None:
+        """Wait until none of a live root's children has a Turn running.
+
+        Each child is then idle, failed or closed. Waiting starts no root Turn:
+        a child's late result stays queued for the root. Returns at once for a
+        root without subagents, or one that is not live.
+        """
+        controller = self._subagent_controller(root_session_id)
+        if controller is not None:
+            await controller.wait_until_settled()
+
+    async def interrupt_children(
+        self, root_session_id: str, reason: str
+    ) -> tuple[ChildInterruptResult, ...]:
+        """Interrupt every running child of a live root, the way the root's own
+        ``interrupt`` call would, with ``reason`` as the child Turn's reason.
+        Returns one result per child that was running: an interrupt that
+        fails for one child is reported for it and does not stop the others.
+
+        Does not wait for the children to settle; see
+        :meth:`wait_for_children_settled`.
+        """
+        controller = self._subagent_controller(root_session_id)
+        if controller is None:
+            return ()
+        return await controller.interrupt_running_children(reason)
+
+    def _subagent_controller(self, root_session_id: str) -> SubagentController | None:
+        root = self._live_session(root_session_id)
+        runtime = root._runtime if root is not None else None
+        return runtime._subagent_controller if runtime is not None else None
+
     def open_callbacks(self, root_session_id: str) -> tuple[JsonObject, ...]:
         callbacks: list[JsonObject] = []
         for entry in self._sessions.values():
@@ -1775,7 +1827,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         core_config, adapter_config = child_config(binding, identity.session_id)
         if not isinstance(binding, LocalChildSessionBinding):
             raise TypeError("local child Host requires a local child binding")
-        hook_handlers = self._child_hook_handlers(identity, core_config)
+        core_config, hook_handlers = self._inherit_parent_hooks(identity, core_config)
         async with self._child_lock:
             live = self._live_session(identity.session_id)
             if live is not None:
@@ -1865,7 +1917,9 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
                     # compose onto, so a push that goes first is rolled straight
                     # back off. Publish once the settle leaves Core on that base,
                     # the way resume does for a root.
-                    await self._initialize_integrations(session, push_to_core=False)
+                    await self._initialize_integrations(
+                        session, push_to_core=False, mcp_from_cache=False
+                    )
                 await self._register(session)
                 await session._restore_child_execution(
                     start_new_actions=start_new_actions,
@@ -1884,20 +1938,41 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
                 raise
             return ChildSessionHandle(session_id=identity.session_id)
 
-    def _child_hook_handlers(
+    def _inherit_parent_hooks(
         self, identity: SubagentSessionIdentity, core_config: RustHarnessConfig
-    ) -> HookHandlers | None:
-        # ``_child_core_config`` copies the parent's capability set and clears only
-        # ``agent_types``, so the child's Core carries the parent's ``hook_bindings``
-        # verbatim while their handlers live on the parent Session. An unresolvable
-        # binding is skipped, not fatal (``_resolve_hooks``), so without this the guards
-        # would silently stop guarding the moment the model delegates.
-        if not core_config.capabilities.hook_bindings:
-            return None
-        parent = self._live_session(identity.parent_session_id)
+    ) -> tuple[RustHarnessConfig, HookHandlers]:
+        """The child's Core config with every hook its parent runs, and their handlers.
+
+        A child binding is resolved beneath the Host's configuration, which holds no
+        session hooks: those are bound to each root when it starts or resumes. The
+        child therefore takes them from its parent, both the bindings its Core
+        dispatches and the handlers behind them. Missing either half fails open, since
+        Core asks for no hook it has no binding for and an unresolvable binding is
+        skipped rather than fatal, so a guard would stop guarding the moment the model
+        delegates. A parent that cannot be found is an error for the same reason.
+        """
+        parent = self._live_session(
+            identity.parent_session_id
+        ) or self._opening_parents.get(identity.parent_session_id)
         if parent is None:
             raise HarnessSessionNotFoundError(identity.parent_session_id)
-        return parent.foreign_hook_handlers
+        own = core_config.capabilities.hook_bindings
+        known = {binding.id for binding in own}
+        inherited = [
+            binding
+            for binding in parent._runtime_for_host().config.capabilities.hook_bindings
+            if binding.id not in known
+        ]
+        if inherited:
+            core_config = core_config.model_copy(
+                update={
+                    "capabilities": core_config.capabilities.model_copy(
+                        update={"hook_bindings": [*own, *inherited]}, deep=True
+                    )
+                },
+                deep=True,
+            )
+        return core_config, parent.foreign_hook_handlers
 
     async def start_child_turn(
         self,
@@ -1945,6 +2020,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         *,
         target: InterruptTarget | CloseRunningTarget,
         operation_key: str,
+        reason: str = "interrupted by parent",
     ) -> ChildCommandAdmission:
         session = self._require_live_child(child)
         identity = session._runtime_for_host().identity
@@ -1954,6 +2030,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             parent_session_id=identity.parent_session_id,
             target=target,
             operation_key=operation_key,
+            reason=reason,
         )
         return ChildCommandAdmission(target=target, turn_id=target.command.turn_id)
 
@@ -2086,6 +2163,28 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             projection_state=stored.projection_state,
         )
         return True
+
+    async def child_is_quiescent(self, child_session_id: str) -> bool:
+        """Whether a child's own store holds no Turn in flight.
+
+        The parent record cannot say: a restore settles an interrupted child in
+        the parent only, and a child can admit a command before its parent
+        records it. A missing child is not quiescent.
+        """
+        session = self._live_session(child_session_id)
+        if session is not None:
+            runtime = session._runtime_for_host()
+            return runtime.runtime_state.quiescent and (
+                runtime.inspection.status not in {"running", "compacting"}
+            )
+        store = UnifiedSessionStore(self._storage_root, child_session_id)
+        if not store.exists:
+            return False
+        stored = await asyncio.to_thread(store.load)
+        turn = stored.projection_state.snapshot.latest_turn
+        return stored.runtime_state.quiescent and (
+            turn is None or turn.status != "in_progress"
+        )
 
     async def reconfigure_subagents(
         self, session_id: str, adapter_config: LocalRuntimeAdapterConfig
@@ -2827,6 +2926,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             if action_adapter is not None
             else adapter_config,
             core_config=runtime_config_template,
+            foreign_hook_handlers=hook_handlers,
             release_plugins=self._release_plugins(session_id),
             read_plugin_info=self._read_plugin_info(session_id),
             on_reconfigure_subagents=lambda cfg, sid=session_id: (
@@ -3260,7 +3360,11 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         return session
 
     async def _initialize_integrations(
-        self, session: UnifiedHarnessSessionBackend, *, push_to_core: bool = True
+        self,
+        session: UnifiedHarnessSessionBackend,
+        *,
+        push_to_core: bool = True,
+        mcp_from_cache: bool = True,
     ) -> None:
         """Resolve MCP and connector catalogs into dispatchable route snapshots.
 
@@ -3269,6 +3373,10 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         routes available before recovering an in-flight turn (Core rejects
         reconfigure while a turn is running); ``_push_integration_capabilities``
         then publishes them once recovery leaves Core idle.
+
+        With ``mcp_from_cache`` and a catalog configured to open from cache, MCP
+        servers resolve from cached descriptors only and one without them is
+        left pending for the caller to discover.
         """
         if self._mcp_catalog is not None and self._mcp_catalog.servers:
             logger.debug(
@@ -3280,6 +3388,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
                 self._mcp_catalog,
                 force_remote_discovery=False,
                 push_to_core=push_to_core,
+                cached_only=mcp_from_cache and self._mcp_open_from_cache,
             )
             logger.debug("MCP integrations initialized for %s", session.session_id)
         if (
@@ -3322,6 +3431,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
         session: UnifiedHarnessSessionBackend,
         plugins: SessionPluginBinding | None = None,
     ) -> None:
+        self._opening_parents[session.session_id] = session
         await self._initialize_subagent_runtime(
             session._runtime_for_host(),
             self._subagent_configuration,
@@ -3344,6 +3454,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             child_host=self,
             bindings=configured.bindings,
             policy_ceiling=configured.policy_ceiling,
+            limits=configured.limits,
         )
         if base is not None and adapter is not None:
             self._subagent_pins[controller] = (base, adapter)
@@ -3963,6 +4074,7 @@ class UnifiedHarnessSessionBackendHost:  # noqa: PLR0904 - implements the app-se
             self._sessions[session.session_id] = _LoadedSessionEntry(
                 session=session, attachments=1
             )
+            self._opening_parents.pop(session.session_id, None)
         session._configure_work_state_callback(self._session_work_state_changed)
         if not session.ephemeral:
             self._connect_child_events(session)
@@ -5012,9 +5124,12 @@ def _core_config(session_id: str) -> RustHarnessConfig:
     return RustHarnessConfig(
         task_id=session_id,
         settings=RustHarnessSettings(
-            turn=RustTurnSettings(max_iterations=25),
+            turn=RustTurnSettings(),
             context=RustContextSettings(
-                compaction=RustDisabledCompactionPolicy(), image_token_cost="fixed"
+                compaction=RustDisabledCompactionPolicy(),
+                image_token_cost="fixed",
+                # This Runtime shapes the standalone compaction request.
+                compaction_fallback="standalone",
             ),
             tools=RustToolSettings(
                 programmatic=RustProgrammaticToolSettings(

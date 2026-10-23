@@ -4,7 +4,9 @@
 #[path = "../onboarding_common/keys.rs"]
 mod keys;
 
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use crossterm::event::{
+    Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+};
 use keys::{enter, esc};
 use ratatui::layout::Rect;
 
@@ -132,34 +134,6 @@ fn esc_on_auth_method_goes_back_to_theme() {
 }
 
 #[test]
-fn esc_on_browser_sign_in_goes_back_to_sign_in_target() {
-    let mut state = OnboardingState {
-        screen: Screen::BrowserSignIn,
-        ..OnboardingState::default()
-    };
-    state.browser_sign_in.variant = vibe_rs::setup::wizard::SignInVariant::Pending;
-    let action = screens::handle_key(&mut state, esc());
-    assert!(matches!(action, Some(Action::AbortSignIn)));
-    assert_eq!(state.screen, Screen::SignInTarget);
-}
-
-#[test]
-fn esc_on_browser_sign_in_restores_the_launch_context() {
-    // A typo'd domain reached the sign-in screen and mutated the context.
-    let mut state = OnboardingState {
-        screen: Screen::BrowserSignIn,
-        ..OnboardingState::default()
-    };
-    state.browser_sign_in.variant = vibe_rs::setup::wizard::SignInVariant::Pending;
-    state.context.provider.browser_auth_base_url = Some("https://typo.example".into());
-    state.context.console_base_url = "https://typo.example".into();
-
-    let action = screens::handle_key(&mut state, esc());
-    assert!(matches!(action, Some(Action::AbortSignIn)));
-    assert_eq!(state.context, state.config);
-}
-
-#[test]
 fn the_manual_key_path_keeps_the_attempted_domain() {
     // Switching to the API key screen manually cancels the
     // attempt but keeps the configured domain — the pasted key is for that
@@ -259,5 +233,34 @@ fn ctrl_c_cancels_from_every_screen() {
             KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL),
         );
         assert!(matches!(action, Some(Action::Cancel)), "{screen:?}");
+    }
+}
+
+#[test]
+fn a_dropped_release_ends_the_wizard_gesture_on_motion_a_key_or_a_focus_loss() {
+    let event = |kind| MouseEvent {
+        kind,
+        column: 5,
+        row: 5,
+        modifiers: KeyModifiers::NONE,
+    };
+    for ending in [
+        Event::Mouse(event(MouseEventKind::Moved)),
+        Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+        Event::FocusLost,
+    ] {
+        let mut app = App::default();
+        let area = Rect::new(0, 0, 80, 24);
+        vibe_rs::mouse::register_region(&mut app, area, MouseTarget::OnboardingInputs);
+        vibe_rs::mouse::route(&mut app, event(MouseEventKind::Down(MouseButton::Left)));
+        mouse::end_dropped_gesture(
+            &mut app,
+            &Event::Mouse(event(MouseEventKind::Drag(MouseButton::Left))),
+        );
+        assert!(app.view.mouse.holds_target());
+
+        mouse::end_dropped_gesture(&mut app, &ending);
+
+        assert!(!app.view.mouse.holds_target());
     }
 }

@@ -198,7 +198,6 @@ fn subagent_list_event(app: &mut App, event: MouseEvent) {
             });
         }
         MouseEventKind::Down(MouseButton::Left) if index.is_some() => {
-            app.subagents.list.mouse_session_id = None;
             app.subagents.list.focused = true;
             app.set_app_focus(false);
             crate::selection::blur_composer(app);
@@ -348,6 +347,8 @@ pub fn toggle_effect_at(app: &mut App, row: u16) {
     if reveal {
         app.view.expanded.insert(id.clone());
     }
+    // A toggling click ends the chain, so the next click toggles again instead of selecting a word.
+    app.selection.chain = Default::default();
     anchor_toggle(app, row, id, reveal);
 }
 

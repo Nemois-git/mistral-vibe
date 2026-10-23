@@ -67,7 +67,7 @@ dependencies = [
     "linkify-it-py==2.1.0",
     "markdown-it-py==4.0.0",
     "markdownify==1.2.3",
-    "mcp==1.28.1",
+    "mcp==1.30.0",
     "mdit-py-plugins==0.5.0",
     "mdurl==0.1.2",
     "miniaudio==1.71 ; platform_machine != 'aarch64' or sys_platform != 'linux'",

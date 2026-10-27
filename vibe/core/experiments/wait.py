@@ -39,10 +39,11 @@ def reset_experiments_eval_failed() -> None:
 
 
 def experiments_eval_runs(config: VibeConfigSchema) -> bool:
-    """Whether a session on *config* sends an eval: telemetry, the A/B opt-in
-    and a Mistral credential are all needed.
+    """Whether a session on *config* sends an eval: the A/B opt-in and a
+    Mistral credential are needed. Telemetry is not part of the gate —
+    the eval runs with telemetry off.
     """
-    if not (config.enable_telemetry and config.experiments.enable):
+    if not config.experiments.enable:
         return False
     return get_mistral_provider_and_api_key(config) is not None
 

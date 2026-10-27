@@ -82,12 +82,19 @@ async def test_a_cached_eval_written_after_the_config_was_built_still_waits(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "fields",
-    [{"enable_telemetry": False}, {"experiments": {"enable": False}}],
-    ids=["telemetry-off", "experiments-off"],
+    "fields", [{"experiments": {"enable": False}}], ids=["experiments-off"]
 )
 async def test_no_eval_means_no_wait(fields: dict[str, Any]) -> None:
     assert experiments_wait_needed(await _config(**fields)) is False
+
+
+@pytest.mark.asyncio
+async def test_telemetry_off_still_waits_for_the_eval() -> None:
+    # Telemetry and experiments are separate: an A/B opt-in with telemetry
+    # off still buckets, so an unpinned session waits for the eval.
+    orchestrator = await _config(enable_telemetry=False)
+
+    assert experiments_wait_needed(orchestrator) is True
 
 
 @pytest.mark.asyncio

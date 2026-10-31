@@ -84,7 +84,7 @@ dependencies = [
     "platformdirs==4.9.6",
     "protobuf==6.33.6",
     "ptyprocess==0.7.0",
-    "pyasn1==0.6.4",
+    "pyasn1==0.6.5",
     "pyasn1-modules==0.4.2",
     "pycparser==3.0 ; (implementation_name != 'PyPy' and platform_machine != 'aarch64') or (implementation_name != 'PyPy' and platform_python_implementation != 'PyPy') or (implementation_name != 'PyPy' and sys_platform != 'linux')",
     "pydantic==2.13.4",

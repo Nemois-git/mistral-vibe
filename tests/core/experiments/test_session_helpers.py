@@ -19,9 +19,21 @@ from vibe.core.experiments.session import (
 from vibe.core.experiments.wait import experiments_eval_failed
 from vibe.core.identity import IdentityResult
 from vibe.core.paths import EXPERIMENT_EVAL_CACHE_FILE
-from vibe.core.platform_auth import PlatformCredentialSnapshot, PlatformCredentialTarget
+from vibe.core.platform_auth import (
+    ApiKeyPlatformCredentialProvider,
+    PlatformCredentialSnapshot,
+    PlatformCredentialTarget,
+)
+from vibe.core.platform_auth._api_key import api_key_principal
+from vibe.core.platform_auth._mistral import MistralCredentials
 from vibe.core.telemetry.types import LaunchContext, TerminalEmulator
 from vibe.setup.auth.whoami import WhoAmIResult, store_cached_whoami
+
+
+def _mistral(provider: Any) -> MistralCredentials:
+    return MistralCredentials(
+        provider, ApiKeyPlatformCredentialProvider.from_api_key("fake-key")
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -68,11 +80,11 @@ async def test_initialize_returns_false_when_experiments_disabled(
     session_logger = MagicMock()
     session_logger.persist_experiments = persist
     manager = ExperimentManager(client=_StubClient(None))
-    
+
     # No Mistral provider - experiments disabled, no provider
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: None,
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: None,
     )
 
     result = await initialize_experiments(
@@ -95,27 +107,25 @@ async def test_initialize_works_when_telemetry_disabled_but_experiments_enabled(
     persist = AsyncMock()
     session_logger = MagicMock()
     session_logger.persist_experiments = persist
-    
+
     # Mock Mistral provider with API key
     provider_mock = MagicMock()
     provider_mock.api_base = "https://api.mistral.ai/v1"
     provider_mock.api_key_env_var = "MISTRAL_API_KEY"
-    
+
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (provider_mock, "fake-api-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(provider_mock),
     )
     monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_identity",
-        AsyncMock(return_value=None),
+        "vibe.core.experiments.session.fetch_identity", AsyncMock(return_value=None)
     )
     monkeypatch.setattr(
-        "vibe.core.experiments.session.fetch_whoami",
-        AsyncMock(return_value=None),
+        "vibe.core.experiments.session.fetch_whoami", AsyncMock(return_value=None)
     )
-    
+
     manager = ExperimentManager(client=_StubClient(None))
-    
+
     result = await initialize_experiments(
         harness=ExperimentSurface.LEGACY,
         config=_make_config(enable_telemetry=False, enable_experiments=True),
@@ -123,7 +133,7 @@ async def test_initialize_works_when_telemetry_disabled_but_experiments_enabled(
         session_logger=session_logger,
         launch_context=None,
     )
-    
+
     # Should return False because identity/whoami are None, but not because of telemetry
     assert result[0] is False
     # user_plan should be None because whoami is None
@@ -137,8 +147,8 @@ async def test_initialize_clears_eval_cache_when_experiments_disabled(
     # The `vibe` launcher reads the eval cache without the config, so opting
     # out of experiments must drop any stale bucketing left on disk.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     cache_path = EXPERIMENT_EVAL_CACHE_FILE.path
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -162,8 +172,8 @@ async def test_initialize_keeps_eval_cache_when_only_telemetry_disabled(
     # Telemetry opt-out alone must NOT drop the eval cache — the eval cache
     # is gated on `experiments.enable` only, not on telemetry.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     cache_path = EXPERIMENT_EVAL_CACHE_FILE.path
     cache_path.parent.mkdir(parents=True, exist_ok=True)
@@ -190,8 +200,8 @@ async def test_initialize_fetches_telemetry_but_skips_growthbook_when_experiment
     # GrowthBook eval (no bucketing, no eval cache, no prompt refresh, no
     # persisted eval state).
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session.fetch_whoami",
@@ -242,8 +252,8 @@ async def test_initialize_returns_no_plan_data_when_no_mistral_provider(
     config = _make_config()
     config.get_mistral_provider = lambda: None
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: None,
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: None,
     )
     persist = AsyncMock()
     session_logger = MagicMock()
@@ -279,8 +289,8 @@ async def test_initialize_returns_none_when_mistral_provider_but_no_api_key(
     config = _make_config()
     config.get_mistral_provider = lambda: MagicMock()
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: None,
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: None,
     )
     persist = AsyncMock()
     session_logger = MagicMock()
@@ -312,8 +322,8 @@ async def test_initialize_fetches_plan_when_mistral_key_but_non_mistral_active(
     config = _make_config()
     config.is_active_model_mistral = lambda: False
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session.fetch_whoami",
@@ -356,8 +366,8 @@ async def test_initialize_returns_false_when_remote_eval_fails(
     # the helper must NOT report success, so the caller skips the
     # unnecessary system prompt refresh.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session._build_attributes",
@@ -395,8 +405,8 @@ async def test_initialize_returns_true_and_persists_when_remote_eval_succeeds(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session._build_attributes",
@@ -436,8 +446,8 @@ async def test_an_eval_without_a_user_id_stops_later_waits(
     # No hash attribute: the response assigns nothing and is not cached, so a
     # later session would wait for another eval that cannot route it either.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     response = EvalResponse.model_validate({
         "features": {"vibe_cli_system_prompt": {"defaultValue": "cli"}}
@@ -463,8 +473,8 @@ async def test_initialize_uses_provided_terminal_emulator(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     persist = AsyncMock()
     session_logger = MagicMock()
@@ -503,8 +513,10 @@ async def test_initialize_includes_organization_id_from_identity(
     )
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (provider, "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: MistralCredentials(
+            provider, ApiKeyPlatformCredentialProvider("MISTRAL_API_KEY")
+        ),
     )
     resolve_identity = AsyncMock(
         return_value=IdentityResult.model_validate({
@@ -553,8 +565,8 @@ async def test_initialize_omits_organization_id_when_identity_unavailable(
     # Fail-open: identity fetch returns None (stubbed by the autouse fixture),
     # so experiment init still succeeds with organization_id absent.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     session_logger = MagicMock()
     session_logger.persist_experiments = AsyncMock()
@@ -583,8 +595,8 @@ async def test_initialize_includes_organization_kind_from_whoami(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session.fetch_whoami",
@@ -623,8 +635,8 @@ async def test_initialize_includes_plan_from_whoami(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session.fetch_whoami",
@@ -665,8 +677,8 @@ async def test_initialize_omits_plan_when_whoami_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     # _stub_fetch_whoami autouse fixture already returns None — no override needed.
     session_logger = MagicMock()
@@ -696,8 +708,8 @@ async def test_initialize_omits_organization_kind_when_whoami_unavailable(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     # _stub_fetch_whoami autouse fixture already returns None — no override needed.
     session_logger = MagicMock()
@@ -726,8 +738,8 @@ async def test_initialize_includes_workspace_id_from_identity(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session.fetch_identity",
@@ -764,8 +776,8 @@ async def test_initialize_uses_resolve_whoami_override(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     whoami_result = WhoAmIResult(
         plan_type=AccountPlanKind.MISTRAL_CODE,
@@ -802,8 +814,8 @@ async def test_initialize_reports_the_serving_backend_to_growthbook(
     monkeypatch: pytest.MonkeyPatch, harness: ExperimentSurface
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     client = _StubClient(EvalResponse.model_validate({"features": {}}))
     manager = ExperimentManager(client=client)
@@ -825,8 +837,8 @@ async def test_initialize_caches_the_eval_response_once_bucketing_resolved(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session._build_attributes",
@@ -866,8 +878,8 @@ async def test_initialize_keeps_the_cache_when_bucketing_never_resolved(
     # Without the hash attribute the response carries no assignment, and caching
     # it would overwrite a good entry.
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (MagicMock(), "fake-key"),
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(MagicMock()),
     )
     monkeypatch.setattr(
         "vibe.core.experiments.session._build_attributes",
@@ -915,12 +927,11 @@ async def test_fetch_and_cache_takes_the_plan_from_the_whoami_disk_cache(
     # As on a session start: the cached /whoami answer, not a live call.
     monkeypatch.setenv("MISTRAL_API_KEY", "fake-key")
     monkeypatch.setattr(
-        "vibe.core.experiments.session.get_mistral_provider_and_api_key",
-        lambda _config: (
+        "vibe.core.experiments.session.mistral_credentials",
+        lambda _config, _credentials=None: _mistral(
             MagicMock(
                 api_base="https://api.mistral.ai/v1", api_key_env_var="MISTRAL_API_KEY"
-            ),
-            "fake-key",
+            )
         ),
     )
     monkeypatch.setattr(
@@ -929,7 +940,7 @@ async def test_fetch_and_cache_takes_the_plan_from_the_whoami_disk_cache(
     live_whoami = AsyncMock(side_effect=AssertionError("live /whoami call"))
     monkeypatch.setattr("vibe.setup.auth.whoami.HttpAccountGateway.read", live_whoami)
     store_cached_whoami(
-        "fake-key",
+        api_key_principal("fake-key"),
         WhoAmIResult(
             plan_type=AccountPlanKind.MISTRAL_CODE,
             plan_name="cached-plan",
